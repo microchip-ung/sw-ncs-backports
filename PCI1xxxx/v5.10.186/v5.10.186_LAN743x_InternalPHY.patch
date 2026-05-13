@@ -1,0 +1,3558 @@
+diff --git a/drivers/net/ethernet/microchip/lan743x_ethtool.c b/drivers/net/ethernet/microchip/lan743x_ethtool.c
+index dcde496da..347962be5 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ethtool.c
++++ b/drivers/net/ethernet/microchip/lan743x_ethtool.c
+@@ -7,6 +7,8 @@
+ #include <linux/phy.h>
+ #include "lan743x_main.h"
+ #include "lan743x_ethtool.h"
++#include <linux/sched.h>
++#include <linux/iopoll.h>
+ 
+ /* eeprom */
+ #define LAN743X_EEPROM_MAGIC		    (0x74A5)
+@@ -19,6 +21,10 @@
+ #define OTP_INDICATOR_1			    (0xF3)
+ #define OTP_INDICATOR_2			    (0xF7)
+ 
++#define LOCK_TIMEOUT_MAX_CNT		    (100) // 1 sec (10 msce * 100)
++
++#define LAN743X_CSR_READ_OP(offset)	     lan743x_csr_read(adapter, offset)
++
+ static int lan743x_otp_power_up(struct lan743x_adapter *adapter)
+ {
+ 	u32 reg_value;
+@@ -149,6 +155,216 @@ static int lan743x_otp_write(struct lan743x_adapter *adapter, u32 offset,
+ 	return 0;
+ }
+ 
++int lan743x_hs_syslock_acquire(struct lan743x_adapter *adapter,
++			       u16 timeout)
++{
++	u16 timeout_cnt = 0;
++	u32 val;
++
++	do {
++		spin_lock(&adapter->eth_syslock_spinlock);
++		if (adapter->eth_syslock_acquire_cnt == 0) {
++			lan743x_csr_write(adapter, ETH_SYSTEM_SYS_LOCK_REG,
++					  SYS_LOCK_REG_ENET_SS_LOCK_);
++			val = lan743x_csr_read(adapter,
++					       ETH_SYSTEM_SYS_LOCK_REG);
++			if (val & SYS_LOCK_REG_ENET_SS_LOCK_) {
++				adapter->eth_syslock_acquire_cnt++;
++				WARN_ON(adapter->eth_syslock_acquire_cnt == 0);
++				spin_unlock(&adapter->eth_syslock_spinlock);
++				break;
++			}
++		} else {
++			adapter->eth_syslock_acquire_cnt++;
++			WARN_ON(adapter->eth_syslock_acquire_cnt == 0);
++			spin_unlock(&adapter->eth_syslock_spinlock);
++			break;
++		}
++
++		spin_unlock(&adapter->eth_syslock_spinlock);
++
++		if (timeout_cnt++ < timeout)
++			usleep_range(10000, 11000);
++		else
++			return -ETIMEDOUT;
++	} while (true);
++
++	return 0;
++}
++
++void lan743x_hs_syslock_release(struct lan743x_adapter *adapter)
++{
++	u32 val;
++
++	spin_lock(&adapter->eth_syslock_spinlock);
++	WARN_ON(adapter->eth_syslock_acquire_cnt == 0);
++
++	if (adapter->eth_syslock_acquire_cnt) {
++		adapter->eth_syslock_acquire_cnt--;
++		if (adapter->eth_syslock_acquire_cnt == 0) {
++			lan743x_csr_write(adapter, ETH_SYSTEM_SYS_LOCK_REG, 0);
++			val = lan743x_csr_read(adapter,
++					       ETH_SYSTEM_SYS_LOCK_REG);
++			WARN_ON((val & SYS_LOCK_REG_ENET_SS_LOCK_) != 0);
++		}
++	}
++
++	spin_unlock(&adapter->eth_syslock_spinlock);
++}
++
++static void lan743x_hs_otp_power_up(struct lan743x_adapter *adapter)
++{
++	u32 reg_value;
++
++	reg_value = lan743x_csr_read(adapter, HS_OTP_PWR_DN);
++	if (reg_value & OTP_PWR_DN_PWRDN_N_) {
++		reg_value &= ~OTP_PWR_DN_PWRDN_N_;
++		lan743x_csr_write(adapter, HS_OTP_PWR_DN, reg_value);
++		/* To flush the posted write so the subsequent delay is
++		 * guaranteed to happen after the write at the hardware
++		 */
++		lan743x_csr_read(adapter, HS_OTP_PWR_DN);
++		udelay(1);
++	}
++}
++
++static void lan743x_hs_otp_power_down(struct lan743x_adapter *adapter)
++{
++	u32 reg_value;
++
++	reg_value = lan743x_csr_read(adapter, HS_OTP_PWR_DN);
++	if (!(reg_value & OTP_PWR_DN_PWRDN_N_)) {
++		reg_value |= OTP_PWR_DN_PWRDN_N_;
++		lan743x_csr_write(adapter, HS_OTP_PWR_DN, reg_value);
++		/* To flush the posted write so the subsequent delay is
++		 * guaranteed to happen after the write at the hardware
++		 */
++		lan743x_csr_read(adapter, HS_OTP_PWR_DN);
++		udelay(1);
++	}
++}
++
++static void lan743x_hs_otp_set_address(struct lan743x_adapter *adapter,
++				       u32 address)
++{
++	lan743x_csr_write(adapter, HS_OTP_ADDR_HIGH, (address >> 8) & 0x03);
++	lan743x_csr_write(adapter, HS_OTP_ADDR_LOW, address & 0xFF);
++}
++
++static void lan743x_hs_otp_read_go(struct lan743x_adapter *adapter)
++{
++	lan743x_csr_write(adapter, HS_OTP_FUNC_CMD, OTP_FUNC_CMD_READ_);
++	lan743x_csr_write(adapter, HS_OTP_CMD_GO, OTP_CMD_GO_GO_);
++}
++
++static int lan743x_hs_otp_cmd_cmplt_chk(struct lan743x_adapter *adapter)
++{
++	u32 val;
++
++	return readx_poll_timeout(LAN743X_CSR_READ_OP, HS_OTP_STATUS, val,
++			!(val & OTP_STATUS_BUSY_),
++			80, 10000);
++}
++
++static int lan743x_hs_otp_read(struct lan743x_adapter *adapter, u32 offset,
++			       u32 length, u8 *data)
++{
++	int ret;
++	int i;
++
++	ret = lan743x_hs_syslock_acquire(adapter, LOCK_TIMEOUT_MAX_CNT);
++	if (ret < 0)
++		return ret;
++
++	lan743x_hs_otp_power_up(adapter);
++
++	ret = lan743x_hs_otp_cmd_cmplt_chk(adapter);
++	if (ret < 0)
++		goto power_down;
++
++	lan743x_hs_syslock_release(adapter);
++
++	for (i = 0; i < length; i++) {
++		ret = lan743x_hs_syslock_acquire(adapter,
++						 LOCK_TIMEOUT_MAX_CNT);
++		if (ret < 0)
++			return ret;
++
++		lan743x_hs_otp_set_address(adapter, offset + i);
++
++		lan743x_hs_otp_read_go(adapter);
++		ret = lan743x_hs_otp_cmd_cmplt_chk(adapter);
++		if (ret < 0)
++			goto power_down;
++
++		data[i] = lan743x_csr_read(adapter, HS_OTP_READ_DATA);
++
++		lan743x_hs_syslock_release(adapter);
++	}
++
++	ret = lan743x_hs_syslock_acquire(adapter,
++					 LOCK_TIMEOUT_MAX_CNT);
++	if (ret < 0)
++		return ret;
++
++power_down:
++	lan743x_hs_otp_power_down(adapter);
++	lan743x_hs_syslock_release(adapter);
++
++	return ret;
++}
++
++static int lan743x_hs_otp_write(struct lan743x_adapter *adapter, u32 offset,
++				u32 length, u8 *data)
++{
++	int ret;
++	int i;
++
++	ret = lan743x_hs_syslock_acquire(adapter, LOCK_TIMEOUT_MAX_CNT);
++	if (ret < 0)
++		return ret;
++
++	lan743x_hs_otp_power_up(adapter);
++
++	ret = lan743x_hs_otp_cmd_cmplt_chk(adapter);
++	if (ret < 0)
++		goto power_down;
++
++	/* set to BYTE program mode */
++	lan743x_csr_write(adapter, HS_OTP_PRGM_MODE, OTP_PRGM_MODE_BYTE_);
++
++	lan743x_hs_syslock_release(adapter);
++
++	for (i = 0; i < length; i++) {
++		ret = lan743x_hs_syslock_acquire(adapter,
++						 LOCK_TIMEOUT_MAX_CNT);
++		if (ret < 0)
++			return ret;
++
++		lan743x_hs_otp_set_address(adapter, offset + i);
++
++		lan743x_csr_write(adapter, HS_OTP_PRGM_DATA, data[i]);
++		lan743x_csr_write(adapter, HS_OTP_TST_CMD, OTP_TST_CMD_PRGVRFY_);
++		lan743x_csr_write(adapter, HS_OTP_CMD_GO, OTP_CMD_GO_GO_);
++
++		ret = lan743x_hs_otp_cmd_cmplt_chk(adapter);
++		if (ret < 0)
++			goto power_down;
++
++		lan743x_hs_syslock_release(adapter);
++	}
++
++	ret = lan743x_hs_syslock_acquire(adapter, LOCK_TIMEOUT_MAX_CNT);
++	if (ret < 0)
++		return ret;
++
++power_down:
++	lan743x_hs_otp_power_down(adapter);
++	lan743x_hs_syslock_release(adapter);
++
++	return ret;
++}
++
+ static int lan743x_eeprom_wait(struct lan743x_adapter *adapter)
+ {
+ 	unsigned long start_time = jiffies;
+@@ -263,6 +479,100 @@ static int lan743x_eeprom_write(struct lan743x_adapter *adapter,
+ 	return 0;
+ }
+ 
++static int lan743x_hs_eeprom_cmd_cmplt_chk(struct lan743x_adapter *adapter)
++{
++	u32 val;
++
++	return readx_poll_timeout(LAN743X_CSR_READ_OP, HS_E2P_CMD, val,
++			(!(val & HS_E2P_CMD_EPC_BUSY_) ||
++			 (val & HS_E2P_CMD_EPC_TIMEOUT_)),
++			50, 10000);
++}
++
++static int lan743x_hs_eeprom_read(struct lan743x_adapter *adapter,
++				  u32 offset, u32 length, u8 *data)
++{
++	int retval;
++	u32 val;
++	int i;
++
++	retval = lan743x_hs_syslock_acquire(adapter, LOCK_TIMEOUT_MAX_CNT);
++	if (retval < 0)
++		return retval;
++
++	retval = lan743x_hs_eeprom_cmd_cmplt_chk(adapter);
++	lan743x_hs_syslock_release(adapter);
++	if (retval < 0)
++		return retval;
++
++	for (i = 0; i < length; i++) {
++		retval = lan743x_hs_syslock_acquire(adapter,
++						    LOCK_TIMEOUT_MAX_CNT);
++		if (retval < 0)
++			return retval;
++
++		val = HS_E2P_CMD_EPC_BUSY_ | HS_E2P_CMD_EPC_CMD_READ_;
++		val |= (offset & HS_E2P_CMD_EPC_ADDR_MASK_);
++		lan743x_csr_write(adapter, HS_E2P_CMD, val);
++		retval = lan743x_hs_eeprom_cmd_cmplt_chk(adapter);
++		if (retval < 0) {
++			lan743x_hs_syslock_release(adapter);
++			return retval;
++		}
++
++		val = lan743x_csr_read(adapter, HS_E2P_DATA);
++
++		lan743x_hs_syslock_release(adapter);
++
++		data[i] = val & 0xFF;
++		offset++;
++	}
++
++	return 0;
++}
++
++static int lan743x_hs_eeprom_write(struct lan743x_adapter *adapter,
++				   u32 offset, u32 length, u8 *data)
++{
++	int retval;
++	u32 val;
++	int i;
++
++	retval = lan743x_hs_syslock_acquire(adapter, LOCK_TIMEOUT_MAX_CNT);
++	if (retval < 0)
++		return retval;
++
++	retval = lan743x_hs_eeprom_cmd_cmplt_chk(adapter);
++	lan743x_hs_syslock_release(adapter);
++	if (retval < 0)
++		return retval;
++
++	for (i = 0; i < length; i++) {
++		retval = lan743x_hs_syslock_acquire(adapter,
++						    LOCK_TIMEOUT_MAX_CNT);
++		if (retval < 0)
++			return retval;
++
++		/* Fill data register */
++		val = data[i];
++		lan743x_csr_write(adapter, HS_E2P_DATA, val);
++
++		/* Send "write" command */
++		val = HS_E2P_CMD_EPC_BUSY_ | HS_E2P_CMD_EPC_CMD_WRITE_;
++		val |= (offset & HS_E2P_CMD_EPC_ADDR_MASK_);
++		lan743x_csr_write(adapter, HS_E2P_CMD, val);
++
++		retval = lan743x_hs_eeprom_cmd_cmplt_chk(adapter);
++		lan743x_hs_syslock_release(adapter);
++		if (retval < 0)
++			return retval;
++
++		offset++;
++	}
++
++	return 0;
++}
++
+ static void lan743x_ethtool_get_drvinfo(struct net_device *netdev,
+ 					struct ethtool_drvinfo *info)
+ {
+@@ -304,10 +614,21 @@ static int lan743x_ethtool_get_eeprom(struct net_device *netdev,
+ 	struct lan743x_adapter *adapter = netdev_priv(netdev);
+ 	int ret = 0;
+ 
+-	if (adapter->flags & LAN743X_ADAPTER_FLAG_OTP)
+-		ret = lan743x_otp_read(adapter, ee->offset, ee->len, data);
+-	else
+-		ret = lan743x_eeprom_read(adapter, ee->offset, ee->len, data);
++	if (adapter->flags & LAN743X_ADAPTER_FLAG_OTP) {
++		if (adapter->is_pci11x1x)
++			ret = lan743x_hs_otp_read(adapter, ee->offset,
++						  ee->len, data);
++		else
++			ret = lan743x_otp_read(adapter, ee->offset,
++					       ee->len, data);
++	} else {
++		if (adapter->is_pci11x1x)
++			ret = lan743x_hs_eeprom_read(adapter, ee->offset,
++						     ee->len, data);
++		else
++			ret = lan743x_eeprom_read(adapter, ee->offset,
++						  ee->len, data);
++	}
+ 
+ 	return ret;
+ }
+@@ -321,13 +642,17 @@ static int lan743x_ethtool_set_eeprom(struct net_device *netdev,
+ 	if (adapter->flags & LAN743X_ADAPTER_FLAG_OTP) {
+ 		/* Beware!  OTP is One Time Programming ONLY! */
+ 		if (ee->magic == LAN743X_OTP_MAGIC) {
+-			ret = lan743x_otp_write(adapter, ee->offset,
+-						ee->len, data);
++			if (adapter->is_pci11x1x)
++				ret = lan743x_hs_otp_write(adapter, ee->offset, ee->len, data);
++			else
++				ret = lan743x_otp_write(adapter, ee->offset, ee->len, data);
+ 		}
+ 	} else {
+ 		if (ee->magic == LAN743X_EEPROM_MAGIC) {
+-			ret = lan743x_eeprom_write(adapter, ee->offset,
+-						   ee->len, data);
++			if (adapter->is_pci11x1x)
++				ret = lan743x_hs_eeprom_write(adapter, ee->offset, ee->len, data);
++			else
++				ret = lan743x_eeprom_write(adapter, ee->offset, ee->len, data);
+ 		}
+ 	}
+ 
+@@ -365,6 +690,14 @@ static const char lan743x_set1_sw_cnt_strings[][ETH_GSTRING_LEN] = {
+ 	"RX Queue 3 Frames",
+ };
+ 
++static const char lan743x_tx_queue_cnt_strings[][ETH_GSTRING_LEN] = {
++	"TX Queue 0 Frames",
++	"TX Queue 1 Frames",
++	"TX Queue 2 Frames",
++	"TX Queue 3 Frames",
++	"TX Total Queue Frames",
++};
++
+ static const char lan743x_set2_hw_cnt_strings[][ETH_GSTRING_LEN] = {
+ 	"RX Total Frames",
+ 	"EEE RX LPI Transitions",
+@@ -462,6 +795,7 @@ static const char lan743x_priv_flags_strings[][ETH_GSTRING_LEN] = {
+ static void lan743x_ethtool_get_strings(struct net_device *netdev,
+ 					u32 stringset, u8 *data)
+ {
++	struct lan743x_adapter *adapter = netdev_priv(netdev);
+ 	switch (stringset) {
+ 	case ETH_SS_STATS:
+ 		memcpy(data, lan743x_set0_hw_cnt_strings,
+@@ -473,6 +807,13 @@ static void lan743x_ethtool_get_strings(struct net_device *netdev,
+ 		       sizeof(lan743x_set1_sw_cnt_strings)],
+ 		       lan743x_set2_hw_cnt_strings,
+ 		       sizeof(lan743x_set2_hw_cnt_strings));
++		if (adapter->is_pci11x1x) {
++			memcpy(&data[sizeof(lan743x_set0_hw_cnt_strings) +
++					sizeof(lan743x_set1_sw_cnt_strings) +
++					sizeof(lan743x_set2_hw_cnt_strings)],
++					lan743x_tx_queue_cnt_strings,
++					sizeof(lan743x_tx_queue_cnt_strings));
++		}
+ 		break;
+ 	case ETH_SS_PRIV_FLAGS:
+ 		memcpy(data, lan743x_priv_flags_strings,
+@@ -486,7 +827,9 @@ static void lan743x_ethtool_get_ethtool_stats(struct net_device *netdev,
+ 					      u64 *data)
+ {
+ 	struct lan743x_adapter *adapter = netdev_priv(netdev);
++	u64 total_queue_count = 0;
+ 	int data_index = 0;
++	u64 pkt_cnt;
+ 	u32 buf;
+ 	int i;
+ 
+@@ -500,6 +843,14 @@ static void lan743x_ethtool_get_ethtool_stats(struct net_device *netdev,
+ 		buf = lan743x_csr_read(adapter, lan743x_set2_hw_cnt_addr[i]);
+ 		data[data_index++] = (u64)buf;
+ 	}
++	if (adapter->is_pci11x1x) {
++		for (i = 0; i < ARRAY_SIZE(adapter->tx); i++) {
++			pkt_cnt = (u64)(adapter->tx[i].frame_count);
++			data[data_index++] = pkt_cnt;
++			total_queue_count += pkt_cnt;
++		}
++		data[data_index++] = total_queue_count;
++	}
+ }
+ 
+ static u32 lan743x_ethtool_get_priv_flags(struct net_device *netdev)
+@@ -520,6 +871,8 @@ static int lan743x_ethtool_set_priv_flags(struct net_device *netdev, u32 flags)
+ 
+ static int lan743x_ethtool_get_sset_count(struct net_device *netdev, int sset)
+ {
++	struct lan743x_adapter *adapter = netdev_priv(netdev);
++
+ 	switch (sset) {
+ 	case ETH_SS_STATS:
+ 	{
+@@ -528,6 +881,8 @@ static int lan743x_ethtool_get_sset_count(struct net_device *netdev, int sset)
+ 		ret = ARRAY_SIZE(lan743x_set0_hw_cnt_strings);
+ 		ret += ARRAY_SIZE(lan743x_set1_sw_cnt_strings);
+ 		ret += ARRAY_SIZE(lan743x_set2_hw_cnt_strings);
++		if (adapter->is_pci11x1x)
++			ret += ARRAY_SIZE(lan743x_tx_queue_cnt_strings);
+ 		return ret;
+ 	}
+ 	case ETH_SS_PRIV_FLAGS:
+@@ -730,7 +1085,7 @@ static int lan743x_ethtool_get_eee(struct net_device *netdev,
+ static int lan743x_ethtool_set_eee(struct net_device *netdev,
+ 				   struct ethtool_eee *eee)
+ {
+-	struct lan743x_adapter *adapter = netdev_priv(netdev);
++	struct lan743x_adapter *adapter;
+ 	struct phy_device *phydev = NULL;
+ 	u32 buf = 0;
+ 	int ret = 0;
+@@ -780,12 +1135,20 @@ static void lan743x_ethtool_get_wol(struct net_device *netdev,
+ 
+ 	wol->supported = 0;
+ 	wol->wolopts = 0;
+-	phy_ethtool_get_wol(netdev->phydev, wol);
++
++	if (netdev->phydev)
++		phy_ethtool_get_wol(netdev->phydev, wol);
+ 
+ 	wol->supported |= WAKE_BCAST | WAKE_UCAST | WAKE_MCAST |
+ 		WAKE_MAGIC | WAKE_PHY | WAKE_ARP;
+ 
++	if (adapter->is_pci11x1x)
++		wol->supported |= WAKE_MAGICSECURE;
++
+ 	wol->wolopts |= adapter->wolopts;
++
++	if (adapter->wolopts & WAKE_MAGICSECURE)
++		memcpy(wol->sopass, adapter->sopass, sizeof(wol->sopass));
+ }
+ 
+ static int lan743x_ethtool_set_wol(struct net_device *netdev,
+@@ -806,14 +1169,200 @@ static int lan743x_ethtool_set_wol(struct net_device *netdev,
+ 		adapter->wolopts |= WAKE_PHY;
+ 	if (wol->wolopts & WAKE_ARP)
+ 		adapter->wolopts |= WAKE_ARP;
++	if (wol->wolopts & WAKE_MAGICSECURE &&
++	    wol->wolopts & WAKE_MAGIC) {
++		memcpy(adapter->sopass, wol->sopass, sizeof(wol->sopass));
++		adapter->wolopts |= WAKE_MAGICSECURE;
++	} else {
++		memset(adapter->sopass, 0, sizeof(u8) * SOPASS_MAX);
++	}
+ 
+ 	device_set_wakeup_enable(&adapter->pdev->dev, (bool)wol->wolopts);
+ 
+-	phy_ethtool_set_wol(netdev->phydev, wol);
++	return netdev->phydev ? phy_ethtool_set_wol(netdev->phydev, wol)
++		: -ENETDOWN;
++}
++#endif /* CONFIG_PM */
++
++static void lan743x_common_regs(struct net_device *dev, void *p)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	u32 *rb = p;
++
++	memset(p, 0, (MAX_LAN743X_ETH_COMMON_REGS * sizeof(u32)));
++
++	rb[ETH_PRIV_FLAGS] = adapter->flags;
++	rb[ETH_ID_REV]     = lan743x_csr_read(adapter, ID_REV);
++	rb[ETH_FPGA_REV]   = lan743x_csr_read(adapter, FPGA_REV);
++	rb[ETH_STRAP_READ] = lan743x_csr_read(adapter, STRAP_READ);
++	rb[ETH_INT_STS]    = lan743x_csr_read(adapter, INT_STS);
++	rb[ETH_HW_CFG]     = lan743x_csr_read(adapter, HW_CFG);
++	rb[ETH_PMT_CTL]    = lan743x_csr_read(adapter, PMT_CTL);
++	rb[ETH_E2P_CMD]    = lan743x_csr_read(adapter, E2P_CMD);
++	rb[ETH_E2P_DATA]   = lan743x_csr_read(adapter, E2P_DATA);
++	rb[ETH_MAC_CR]     = lan743x_csr_read(adapter, MAC_CR);
++	rb[ETH_MAC_RX]     = lan743x_csr_read(adapter, MAC_RX);
++	rb[ETH_MAC_TX]     = lan743x_csr_read(adapter, MAC_TX);
++	rb[ETH_FLOW]       = lan743x_csr_read(adapter, MAC_FLOW);
++	rb[ETH_MII_ACC]    = lan743x_csr_read(adapter, MAC_MII_ACC);
++	rb[ETH_MII_DATA]   = lan743x_csr_read(adapter, MAC_MII_DATA);
++	rb[ETH_EEE_TX_LPI_REQ_DLY]  = lan743x_csr_read(adapter, MAC_EEE_TX_LPI_REQ_DLY_CNT);
++	rb[ETH_WUCSR]      = lan743x_csr_read(adapter, MAC_WUCSR);
++	rb[ETH_WK_SRC]     = lan743x_csr_read(adapter, MAC_WK_SRC);
++}
++
++static void lan743x_sgmii_regs(struct net_device *dev, void *p)
++{
++	u32 *rb = p;
++	u16 idx;
++	int val = 0xFFFF;
++	struct {
++		u8 id;
++		u8 dev;
++		u16 addr;
++	} regs[] = {
++		{ ETH_SR_VSMMD_DEV_ID1,                MDIO_MMD_VEND1, 0x0002},
++		{ ETH_SR_VSMMD_DEV_ID2,                MDIO_MMD_VEND1, 0x0003},
++		{ ETH_SR_VSMMD_PCS_ID1,                MDIO_MMD_VEND1, 0x0004},
++		{ ETH_SR_VSMMD_PCS_ID2,                MDIO_MMD_VEND1, 0x0005},
++		{ ETH_SR_VSMMD_STS,                    MDIO_MMD_VEND1, 0x0008},
++		{ ETH_SR_VSMMD_CTRL,                   MDIO_MMD_VEND1, 0x0009},
++		{ ETH_SR_MII_CTRL,                     MDIO_MMD_VEND2, 0x0000},
++		{ ETH_SR_MII_STS,                      MDIO_MMD_VEND2, 0x0001},
++		{ ETH_SR_MII_DEV_ID1,                  MDIO_MMD_VEND2, 0x0002},
++		{ ETH_SR_MII_DEV_ID2,                  MDIO_MMD_VEND2, 0x0003},
++		{ ETH_SR_MII_AN_ADV,                   MDIO_MMD_VEND2, 0x0004},
++		{ ETH_SR_MII_LP_BABL,                  MDIO_MMD_VEND2, 0x0005},
++		{ ETH_SR_MII_EXPN,                     MDIO_MMD_VEND2, 0x0006},
++		{ ETH_SR_MII_EXT_STS,                  MDIO_MMD_VEND2, 0x000F},
++		{ ETH_SR_MII_TIME_SYNC_ABL,            MDIO_MMD_VEND2, 0x0708},
++		{ ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_LWR, MDIO_MMD_VEND2, 0x0709},
++		{ ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_UPR, MDIO_MMD_VEND2, 0x070A},
++		{ ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_LWR, MDIO_MMD_VEND2, 0x070B},
++		{ ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_UPR, MDIO_MMD_VEND2, 0x070C},
++		{ ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_LWR, MDIO_MMD_VEND2, 0x070D},
++		{ ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_UPR, MDIO_MMD_VEND2, 0x070E},
++		{ ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_LWR, MDIO_MMD_VEND2, 0x070F},
++		{ ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_UPR, MDIO_MMD_VEND2, 0x0710},
++		{ ETH_VR_MII_DIG_CTRL1,                MDIO_MMD_VEND2, 0x8000},
++		{ ETH_VR_MII_AN_CTRL,                  MDIO_MMD_VEND2, 0x8001},
++		{ ETH_VR_MII_AN_INTR_STS,              MDIO_MMD_VEND2, 0x8002},
++		{ ETH_VR_MII_TC,                       MDIO_MMD_VEND2, 0x8003},
++		{ ETH_VR_MII_DBG_CTRL,                 MDIO_MMD_VEND2, 0x8005},
++		{ ETH_VR_MII_EEE_MCTRL0,               MDIO_MMD_VEND2, 0x8006},
++		{ ETH_VR_MII_EEE_TXTIMER,              MDIO_MMD_VEND2, 0x8008},
++		{ ETH_VR_MII_EEE_RXTIMER,              MDIO_MMD_VEND2, 0x8009},
++		{ ETH_VR_MII_LINK_TIMER_CTRL,          MDIO_MMD_VEND2, 0x800A},
++		{ ETH_VR_MII_EEE_MCTRL1,               MDIO_MMD_VEND2, 0x800B},
++		{ ETH_VR_MII_DIG_STS,                  MDIO_MMD_VEND2, 0x8010},
++		{ ETH_VR_MII_ICG_ERRCNT1,              MDIO_MMD_VEND2, 0x8011},
++		{ ETH_VR_MII_GPIO,                     MDIO_MMD_VEND2, 0x8015},
++		{ ETH_VR_MII_EEE_LPI_STATUS,           MDIO_MMD_VEND2, 0x8016},
++		{ ETH_VR_MII_EEE_WKERR,                MDIO_MMD_VEND2, 0x8017},
++		{ ETH_VR_MII_MISC_STS,                 MDIO_MMD_VEND2, 0x8018},
++		{ ETH_VR_MII_RX_LSTS,                  MDIO_MMD_VEND2, 0x8020},
++		{ ETH_VR_MII_GEN2_GEN4_TX_BSTCTRL0,    MDIO_MMD_VEND2, 0x8038},
++		{ ETH_VR_MII_GEN2_GEN4_TX_LVLCTRL0,    MDIO_MMD_VEND2, 0x803A},
++		{ ETH_VR_MII_GEN2_GEN4_TXGENCTRL0,     MDIO_MMD_VEND2, 0x803C},
++		{ ETH_VR_MII_GEN2_GEN4_TXGENCTRL1,     MDIO_MMD_VEND2, 0x803D},
++		{ ETH_VR_MII_GEN4_TXGENCTRL2,          MDIO_MMD_VEND2, 0x803E},
++		{ ETH_VR_MII_GEN2_GEN4_TX_STS,         MDIO_MMD_VEND2, 0x8048},
++		{ ETH_VR_MII_GEN2_GEN4_RXGENCTRL0,     MDIO_MMD_VEND2, 0x8058},
++		{ ETH_VR_MII_GEN2_GEN4_RXGENCTRL1,     MDIO_MMD_VEND2, 0x8059},
++		{ ETH_VR_MII_GEN4_RXEQ_CTRL,           MDIO_MMD_VEND2, 0x805B},
++		{ ETH_VR_MII_GEN4_RXLOS_CTRL0,         MDIO_MMD_VEND2, 0x805D},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_CTRL0,     MDIO_MMD_VEND2, 0x8078},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_CTRL1,     MDIO_MMD_VEND2, 0x8079},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_STS,       MDIO_MMD_VEND2, 0x8088},
++		{ ETH_VR_MII_GEN2_GEN4_LVL_CTRL,       MDIO_MMD_VEND2, 0x8090},
++		{ ETH_VR_MII_GEN4_MISC_CTRL2,          MDIO_MMD_VEND2, 0x8093},
++		{ ETH_VR_MII_GEN2_GEN4_MISC_CTRL0,     MDIO_MMD_VEND2, 0x8099},
++		{ ETH_VR_MII_GEN2_GEN4_MISC_CTRL1,     MDIO_MMD_VEND2, 0x809A},
++		{ ETH_VR_MII_SNPS_CR_CTRL,             MDIO_MMD_VEND2, 0x80A0},
++		{ ETH_VR_MII_SNPS_CR_ADDR,             MDIO_MMD_VEND2, 0x80A1},
++		{ ETH_VR_MII_SNPS_CR_DATA,             MDIO_MMD_VEND2, 0x80A2},
++		{ ETH_VR_MII_DIG_CTRL2,                MDIO_MMD_VEND2, 0x80E1},
++		{ ETH_VR_MII_DIG_ERRCNT,               MDIO_MMD_VEND2, 0x80E2},
++	};
++	for (idx = 0; idx < ARRAY_SIZE(regs); idx++)
++		rb[regs[idx].id] = val;
++}
++
++static int lan743x_get_regs_len(struct net_device *dev)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	u32 num_regs = MAX_LAN743X_ETH_COMMON_REGS;
++
++	if (adapter->is_sgmii_en)
++		num_regs += MAX_LAN743X_ETH_SGMII_REGS;
++
++	return num_regs * sizeof(u32);
++}
++
++static void lan743x_get_regs(struct net_device *dev,
++			     struct ethtool_regs *regs, void *p)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	int regs_len;
++
++	regs_len = lan743x_get_regs_len(dev);
++	memset(p, 0, regs_len);
++
++	regs->version = LAN743X_ETH_REG_VERSION;
++	regs->len = regs_len;
++
++	lan743x_common_regs(dev, p);
++	p = (u32 *)p + MAX_LAN743X_ETH_COMMON_REGS;
++
++	if (adapter->is_sgmii_en) {
++		lan743x_sgmii_regs(dev, p);
++		p = (u32 *)p + MAX_LAN743X_ETH_SGMII_REGS;
++	}
++}
++
++static void lan743x_get_pauseparam(struct net_device *dev,
++				   struct ethtool_pauseparam *pause)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	struct lan743x_phy *phy = &adapter->phy;
++
++	if (phy->fc_request_control & FLOW_CTRL_TX)
++		pause->tx_pause = 1;
++	if (phy->fc_request_control & FLOW_CTRL_RX)
++		pause->rx_pause = 1;
++	pause->autoneg = phy->fc_autoneg;
++}
++
++static int lan743x_set_pauseparam(struct net_device *dev,
++				  struct ethtool_pauseparam *pause)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	struct phy_device *phydev = dev->phydev;
++	struct lan743x_phy *phy = &adapter->phy;
++
++	if (!phydev)
++		return -ENODEV;
++
++	if (!phy_validate_pause(phydev, pause))
++		return -EINVAL;
++
++	phy->fc_request_control = 0;
++	if (pause->rx_pause)
++		phy->fc_request_control |= FLOW_CTRL_RX;
++
++	if (pause->tx_pause)
++		phy->fc_request_control |= FLOW_CTRL_TX;
++
++	phy->fc_autoneg = pause->autoneg;
++
++	if (pause->autoneg == AUTONEG_DISABLE)
++		lan743x_mac_flow_ctrl_set_enables(adapter, pause->tx_pause,
++						  pause->rx_pause);
++	else
++		phy_set_asym_pause(phydev, pause->rx_pause,  pause->tx_pause);
+ 
+ 	return 0;
+ }
+-#endif /* CONFIG_PM */
+ 
+ const struct ethtool_ops lan743x_ethtool_ops = {
+ 	.get_drvinfo = lan743x_ethtool_get_drvinfo,
+@@ -839,6 +1388,10 @@ const struct ethtool_ops lan743x_ethtool_ops = {
+ 	.set_eee = lan743x_ethtool_set_eee,
+ 	.get_link_ksettings = phy_ethtool_get_link_ksettings,
+ 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
++	.get_regs_len = lan743x_get_regs_len,
++	.get_regs = lan743x_get_regs,
++	.get_pauseparam = lan743x_get_pauseparam,
++	.set_pauseparam = lan743x_set_pauseparam,
+ #ifdef CONFIG_PM
+ 	.get_wol = lan743x_ethtool_get_wol,
+ 	.set_wol = lan743x_ethtool_set_wol,
+diff --git a/drivers/net/ethernet/microchip/lan743x_ethtool.h b/drivers/net/ethernet/microchip/lan743x_ethtool.h
+index d0d11a777..2c7eb1ff0 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ethtool.h
++++ b/drivers/net/ethernet/microchip/lan743x_ethtool.h
+@@ -6,6 +6,101 @@
+ 
+ #include "linux/ethtool.h"
+ 
++#define LAN743X_ETH_REG_VERSION         1
++
++enum{
++	ETH_PRIV_FLAGS,
++	ETH_ID_REV,
++	ETH_FPGA_REV,
++	ETH_STRAP_READ,
++	ETH_INT_STS,
++	ETH_HW_CFG,
++	ETH_PMT_CTL,
++	ETH_E2P_CMD,
++	ETH_E2P_DATA,
++	ETH_MAC_CR,
++	ETH_MAC_RX,
++	ETH_MAC_TX,
++	ETH_FLOW,
++	ETH_MII_ACC,
++	ETH_MII_DATA,
++	ETH_EEE_TX_LPI_REQ_DLY,
++	ETH_WUCSR,
++	ETH_WK_SRC,
++
++	/* Add new registers above */
++	MAX_LAN743X_ETH_COMMON_REGS
++};
++
++enum {
++	/* SGMII Register */
++	ETH_SR_VSMMD_DEV_ID1,
++	ETH_SR_VSMMD_DEV_ID2,
++	ETH_SR_VSMMD_PCS_ID1,
++	ETH_SR_VSMMD_PCS_ID2,
++	ETH_SR_VSMMD_STS,
++	ETH_SR_VSMMD_CTRL,
++	ETH_SR_MII_CTRL,
++	ETH_SR_MII_STS,
++	ETH_SR_MII_DEV_ID1,
++	ETH_SR_MII_DEV_ID2,
++	ETH_SR_MII_AN_ADV,
++	ETH_SR_MII_LP_BABL,
++	ETH_SR_MII_EXPN,
++	ETH_SR_MII_EXT_STS,
++	ETH_SR_MII_TIME_SYNC_ABL,
++	ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_UPR,
++	ETH_VR_MII_DIG_CTRL1,
++	ETH_VR_MII_AN_CTRL,
++	ETH_VR_MII_AN_INTR_STS,
++	ETH_VR_MII_TC,
++	ETH_VR_MII_DBG_CTRL,
++	ETH_VR_MII_EEE_MCTRL0,
++	ETH_VR_MII_EEE_TXTIMER,
++	ETH_VR_MII_EEE_RXTIMER,
++	ETH_VR_MII_LINK_TIMER_CTRL,
++	ETH_VR_MII_EEE_MCTRL1,
++	ETH_VR_MII_DIG_STS,
++	ETH_VR_MII_ICG_ERRCNT1,
++	ETH_VR_MII_GPIO,
++	ETH_VR_MII_EEE_LPI_STATUS,
++	ETH_VR_MII_EEE_WKERR,
++	ETH_VR_MII_MISC_STS,
++	ETH_VR_MII_RX_LSTS,
++	ETH_VR_MII_GEN2_GEN4_TX_BSTCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TX_LVLCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TXGENCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TXGENCTRL1,
++	ETH_VR_MII_GEN4_TXGENCTRL2,
++	ETH_VR_MII_GEN2_GEN4_TX_STS,
++	ETH_VR_MII_GEN2_GEN4_RXGENCTRL0,
++	ETH_VR_MII_GEN2_GEN4_RXGENCTRL1,
++	ETH_VR_MII_GEN4_RXEQ_CTRL,
++	ETH_VR_MII_GEN4_RXLOS_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MPLL_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MPLL_CTRL1,
++	ETH_VR_MII_GEN2_GEN4_MPLL_STS,
++	ETH_VR_MII_GEN2_GEN4_LVL_CTRL,
++	ETH_VR_MII_GEN4_MISC_CTRL2,
++	ETH_VR_MII_GEN2_GEN4_MISC_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MISC_CTRL1,
++	ETH_VR_MII_SNPS_CR_CTRL,
++	ETH_VR_MII_SNPS_CR_ADDR,
++	ETH_VR_MII_SNPS_CR_DATA,
++	ETH_VR_MII_DIG_CTRL2,
++	ETH_VR_MII_DIG_ERRCNT,
++
++	/* Add new registers above */
++	MAX_LAN743X_ETH_SGMII_REGS
++};
++
+ extern const struct ethtool_ops lan743x_ethtool_ops;
+ 
+ #endif /* _LAN743X_ETHTOOL_H */
+diff --git a/drivers/net/ethernet/microchip/lan743x_main.c b/drivers/net/ethernet/microchip/lan743x_main.c
+index 481f89d19..0e7ad3fc9 100644
+--- a/drivers/net/ethernet/microchip/lan743x_main.c
++++ b/drivers/net/ethernet/microchip/lan743x_main.c
+@@ -18,6 +18,68 @@
+ #include "lan743x_main.h"
+ #include "lan743x_ethtool.h"
+ 
++#define MMD_ACCESS_ADDRESS	0
++#define MMD_ACCESS_WRITE	1
++#define MMD_ACCESS_READ	        2
++#define MMD_ACCESS_READ_INC	3
++#define PCS_POWER_STATE_DOWN	0x6
++#define PCS_POWER_STATE_UP	0x4
++
++static void pci11x1x_strap_get_status(struct lan743x_adapter *adapter)
++{
++	u32 chip_rev;
++	u32 cfg_load;
++	u32 hw_cfg;
++	u32 strap;
++	int ret;
++
++	/* Timeout = 100 (i.e. 1 sec (10 msce * 100)) */
++	ret = lan743x_hs_syslock_acquire(adapter, 100);
++	if (ret < 0) {
++		netif_err(adapter, drv, adapter->netdev,
++			  "Sys Lock acquire failed ret:%d\n", ret);
++		return;
++	}
++	cfg_load = lan743x_csr_read(adapter, ETH_SYS_CONFIG_LOAD_STARTED_REG);
++	lan743x_hs_syslock_release(adapter);
++	hw_cfg = lan743x_csr_read(adapter, HW_CFG);
++
++	if (cfg_load & GEN_SYS_LOAD_STARTED_REG_ETH_ ||
++	    hw_cfg & HW_CFG_RST_PROTECT_) {
++		strap = lan743x_csr_read(adapter, STRAP_READ);
++		if (strap & STRAP_READ_SGMII_EN_)
++			adapter->is_sgmii_en = true;
++		else
++			adapter->is_sgmii_en = false;
++	} else {
++		chip_rev = lan743x_csr_read(adapter, FPGA_REV);
++		if (chip_rev) {
++			if (chip_rev & FPGA_SGMII_OP)
++				adapter->is_sgmii_en = true;
++			else
++				adapter->is_sgmii_en = false;
++		} else {
++			adapter->is_sgmii_en = false;
++		}
++	}
++	adapter->is_sgmii_en = false;
++	//No support for SGMII
++	netif_dbg(adapter, drv, adapter->netdev,
++		  "SGMII I/F %sable\n", adapter->is_sgmii_en ? "En" : "Dis");
++}
++
++static bool is_pci11x1x_chip(struct lan743x_adapter *adapter)
++{
++	struct lan743x_csr *csr = &adapter->csr;
++	u32 id_rev = csr->id_rev;
++
++	if (((id_rev & 0xFFFF0000) == ID_REV_ID_A011_) ||
++	    ((id_rev & 0xFFFF0000) == ID_REV_ID_A041_)) {
++		return true;
++	}
++	return false;
++}
++
+ static void lan743x_pci_cleanup(struct lan743x_adapter *adapter)
+ {
+ 	pci_release_selected_regions(adapter->pdev,
+@@ -140,18 +202,14 @@ static int lan743x_csr_init(struct lan743x_adapter *adapter)
+ 	return result;
+ }
+ 
+-static void lan743x_intr_software_isr(void *context)
++static void lan743x_intr_software_isr(struct lan743x_adapter *adapter)
+ {
+-	struct lan743x_adapter *adapter = context;
+ 	struct lan743x_intr *intr = &adapter->intr;
+-	u32 int_sts;
+ 
+-	int_sts = lan743x_csr_read(adapter, INT_STS);
+-	if (int_sts & INT_BIT_SW_GP_) {
+-		/* disable the interrupt to prevent repeated re-triggering */
+-		lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_SW_GP_);
+-		intr->software_isr_flag = 1;
+-	}
++	/* disable the interrupt to prevent repeated re-triggering */
++	lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_SW_GP_);
++	intr->software_isr_flag = 1;
++	wake_up(&intr->software_isr_wq);
+ }
+ 
+ static void lan743x_tx_isr(void *context, u32 int_sts, u32 flags)
+@@ -254,7 +312,7 @@ static void lan743x_intr_shared_isr(void *context, u32 int_sts, u32 flags)
+ 		}
+ 	}
+ 	if (int_sts & INT_BIT_ALL_TX_) {
+-		for (channel = 0; channel < LAN743X_USED_TX_CHANNELS;
++		for (channel = 0; channel < adapter->used_tx_channels;
+ 			channel++) {
+ 			u32 int_bit = INT_BIT_DMA_TX_(channel);
+ 
+@@ -348,27 +406,24 @@ static irqreturn_t lan743x_intr_entry_isr(int irq, void *ptr)
+ static int lan743x_intr_test_isr(struct lan743x_adapter *adapter)
+ {
+ 	struct lan743x_intr *intr = &adapter->intr;
+-	int result = -ENODEV;
+-	int timeout = 10;
++	int ret;
+ 
+ 	intr->software_isr_flag = 0;
+ 
+ 	/* enable interrupt */
+ 	lan743x_csr_write(adapter, INT_EN_SET, INT_BIT_SW_GP_);
+ 
+-	/* activate interrupt here */
++	/*activate interrupt here */
+ 	lan743x_csr_write(adapter, INT_SET, INT_BIT_SW_GP_);
+-	while ((timeout > 0) && (!(intr->software_isr_flag))) {
+-		usleep_range(1000, 20000);
+-		timeout--;
+-	}
+ 
+-	if (intr->software_isr_flag)
+-		result = 0;
++	ret = wait_event_timeout(intr->software_isr_wq,
++				 intr->software_isr_flag,
++				 msecs_to_jiffies(200));
+ 
+ 	/* disable interrupts */
+ 	lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_SW_GP_);
+-	return result;
++
++	return ret > 0 ? 0 : -ENODEV;
+ }
+ 
+ static int lan743x_intr_register_isr(struct lan743x_adapter *adapter,
+@@ -419,7 +474,7 @@ static u32 lan743x_intr_get_vector_flags(struct lan743x_adapter *adapter,
+ {
+ 	int index;
+ 
+-	for (index = 0; index < LAN743X_MAX_VECTOR_COUNT; index++) {
++	for (index = 0; index < adapter->max_vector_count; index++) {
+ 		if (adapter->intr.vector_list[index].int_mask & int_mask)
+ 			return adapter->intr.vector_list[index].flags;
+ 	}
+@@ -432,9 +487,12 @@ static void lan743x_intr_close(struct lan743x_adapter *adapter)
+ 	int index = 0;
+ 
+ 	lan743x_csr_write(adapter, INT_EN_CLR, INT_BIT_MAS_);
+-	lan743x_csr_write(adapter, INT_VEC_EN_CLR, 0x000000FF);
++	if (adapter->is_pci11x1x)
++		lan743x_csr_write(adapter, INT_VEC_EN_CLR, 0x0000FFFF);
++	else
++		lan743x_csr_write(adapter, INT_VEC_EN_CLR, 0x000000FF);
+ 
+-	for (index = 0; index < LAN743X_MAX_VECTOR_COUNT; index++) {
++	for (index = 0; index < intr->number_of_vectors; index++) {
+ 		if (intr->flags & INTR_FLAG_IRQ_REQUESTED(index)) {
+ 			lan743x_intr_unregister_isr(adapter, index);
+ 			intr->flags &= ~INTR_FLAG_IRQ_REQUESTED(index);
+@@ -454,9 +512,11 @@ static void lan743x_intr_close(struct lan743x_adapter *adapter)
+ 
+ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ {
+-	struct msix_entry msix_entries[LAN743X_MAX_VECTOR_COUNT];
++	struct msix_entry msix_entries[PCI11X1X_MAX_VECTOR_COUNT];
+ 	struct lan743x_intr *intr = &adapter->intr;
++	unsigned int used_tx_channels;
+ 	u32 int_vec_en_auto_clr = 0;
++	u8 max_vector_count;
+ 	u32 int_vec_map0 = 0;
+ 	u32 int_vec_map1 = 0;
+ 	int ret = -ENODEV;
+@@ -466,13 +526,15 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 	intr->number_of_vectors = 0;
+ 
+ 	/* Try to set up MSIX interrupts */
++	max_vector_count = adapter->max_vector_count;
+ 	memset(&msix_entries[0], 0,
+-	       sizeof(struct msix_entry) * LAN743X_MAX_VECTOR_COUNT);
+-	for (index = 0; index < LAN743X_MAX_VECTOR_COUNT; index++)
++	       sizeof(struct msix_entry) * max_vector_count);
++	for (index = 0; index < max_vector_count; index++)
+ 		msix_entries[index].entry = index;
++	used_tx_channels = adapter->used_tx_channels;
+ 	ret = pci_enable_msix_range(adapter->pdev,
+ 				    msix_entries, 1,
+-				    1 + LAN743X_USED_TX_CHANNELS +
++				    1 + used_tx_channels +
+ 				    LAN743X_USED_RX_CHANNELS);
+ 
+ 	if (ret > 0) {
+@@ -542,6 +604,8 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 		flags |= LAN743X_VECTOR_FLAG_SOURCE_ENABLE_R2C;
+ 	}
+ 
++	init_waitqueue_head(&intr->software_isr_wq);
++
+ 	ret = lan743x_intr_register_isr(adapter, 0, flags,
+ 					INT_BIT_ALL_RX_ | INT_BIT_ALL_TX_ |
+ 					INT_BIT_ALL_OTHER_,
+@@ -563,8 +627,15 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 		lan743x_csr_write(adapter, INT_MOD_CFG5, LAN743X_INT_MOD);
+ 		lan743x_csr_write(adapter, INT_MOD_CFG6, LAN743X_INT_MOD);
+ 		lan743x_csr_write(adapter, INT_MOD_CFG7, LAN743X_INT_MOD);
+-		lan743x_csr_write(adapter, INT_MOD_MAP0, 0x00005432);
+-		lan743x_csr_write(adapter, INT_MOD_MAP1, 0x00000001);
++		if (adapter->is_pci11x1x) {
++			lan743x_csr_write(adapter, INT_MOD_CFG8, LAN743X_INT_MOD);
++			lan743x_csr_write(adapter, INT_MOD_CFG9, LAN743X_INT_MOD);
++			lan743x_csr_write(adapter, INT_MOD_MAP0, 0x00007654);
++			lan743x_csr_write(adapter, INT_MOD_MAP1, 0x00003210);
++		} else {
++			lan743x_csr_write(adapter, INT_MOD_MAP0, 0x00005432);
++			lan743x_csr_write(adapter, INT_MOD_MAP1, 0x00000001);
++		}
+ 		lan743x_csr_write(adapter, INT_MOD_MAP2, 0x00FFFFFF);
+ 	}
+ 
+@@ -577,8 +648,8 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 	if (intr->number_of_vectors > 1) {
+ 		int number_of_tx_vectors = intr->number_of_vectors - 1;
+ 
+-		if (number_of_tx_vectors > LAN743X_USED_TX_CHANNELS)
+-			number_of_tx_vectors = LAN743X_USED_TX_CHANNELS;
++		if (number_of_tx_vectors > used_tx_channels)
++			number_of_tx_vectors = used_tx_channels;
+ 		flags = LAN743X_VECTOR_FLAG_SOURCE_STATUS_READ |
+ 			LAN743X_VECTOR_FLAG_SOURCE_STATUS_W2C |
+ 			LAN743X_VECTOR_FLAG_SOURCE_ENABLE_CHECK |
+@@ -616,9 +687,9 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 						  INT_VEC_EN_(vector));
+ 		}
+ 	}
+-	if ((intr->number_of_vectors - LAN743X_USED_TX_CHANNELS) > 1) {
++	if ((intr->number_of_vectors - used_tx_channels) > 1) {
+ 		int number_of_rx_vectors = intr->number_of_vectors -
+-					   LAN743X_USED_TX_CHANNELS - 1;
++					    used_tx_channels - 1;
+ 
+ 		if (number_of_rx_vectors > LAN743X_USED_RX_CHANNELS)
+ 			number_of_rx_vectors = LAN743X_USED_RX_CHANNELS;
+@@ -639,7 +710,7 @@ static int lan743x_intr_open(struct lan743x_adapter *adapter)
+ 				LAN743X_VECTOR_FLAG_SOURCE_STATUS_AUTO_CLEAR;
+ 		}
+ 		for (index = 0; index < number_of_rx_vectors; index++) {
+-			int vector = index + 1 + LAN743X_USED_TX_CHANNELS;
++			int vector = index + 1 +  used_tx_channels;
+ 			u32 int_bit = INT_BIT_DMA_RX_(index);
+ 
+ 			/* map RX interrupt to vector */
+@@ -830,14 +901,13 @@ static int lan743x_mac_init(struct lan743x_adapter *adapter)
+ 
+ static int lan743x_mac_open(struct lan743x_adapter *adapter)
+ {
+-	int ret = 0;
+ 	u32 temp;
+ 
+ 	temp = lan743x_csr_read(adapter, MAC_RX);
+ 	lan743x_csr_write(adapter, MAC_RX, temp | MAC_RX_RXEN_);
+ 	temp = lan743x_csr_read(adapter, MAC_TX);
+ 	lan743x_csr_write(adapter, MAC_TX, temp | MAC_TX_TXEN_);
+-	return ret;
++	return 0;
+ }
+ 
+ static void lan743x_mac_close(struct lan743x_adapter *adapter)
+@@ -857,8 +927,8 @@ static void lan743x_mac_close(struct lan743x_adapter *adapter)
+ 				 1, 1000, 20000, 100);
+ }
+ 
+-static void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
+-					      bool tx_enable, bool rx_enable)
++void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
++				       bool tx_enable, bool rx_enable)
+ {
+ 	u32 flow_setting = 0;
+ 
+@@ -955,14 +1025,6 @@ static void lan743x_phy_link_status_change(struct net_device *netdev)
+ 
+ 		data = lan743x_csr_read(adapter, MAC_CR);
+ 
+-		/* set interface mode */
+-		if (phy_interface_mode_is_rgmii(adapter->phy_mode))
+-			/* RGMII */
+-			data &= ~MAC_CR_MII_EN_;
+-		else
+-			/* GMII */
+-			data |= MAC_CR_MII_EN_;
+-
+ 		/* set duplex mode */
+ 		if (phydev->duplex)
+ 			data |= MAC_CR_DPX_;
+@@ -983,6 +1045,10 @@ static void lan743x_phy_link_status_change(struct net_device *netdev)
+ 			data |= MAC_CR_CFG_H_;
+ 			data &= ~MAC_CR_CFG_L_;
+ 		break;
++		case SPEED_2500:
++			data |= MAC_CR_CFG_H_;
++			data |= MAC_CR_CFG_L_;
++		break;
+ 		}
+ 		lan743x_csr_write(adapter, MAC_CR, data);
+ 
+@@ -1003,49 +1069,64 @@ static void lan743x_phy_close(struct lan743x_adapter *adapter)
+ 
+ 	phy_stop(netdev->phydev);
+ 	phy_disconnect(netdev->phydev);
+-	netdev->phydev = NULL;
++}
++
++static void lan743x_phy_interface_select(struct lan743x_adapter *adapter)
++{
++	u32 id_rev;
++	u32 data;
++
++	data = lan743x_csr_read(adapter, MAC_CR);
++	id_rev = adapter->csr.id_rev & ID_REV_ID_MASK_;
++
++	if (adapter->is_pci11x1x && adapter->is_sgmii_en)
++		adapter->phy_interface = PHY_INTERFACE_MODE_SGMII;
++	else if (id_rev == ID_REV_ID_LAN7430_)
++		adapter->phy_interface = PHY_INTERFACE_MODE_GMII;
++	else if ((id_rev == ID_REV_ID_LAN7431_) && (data & MAC_CR_MII_EN_))
++		adapter->phy_interface = PHY_INTERFACE_MODE_MII;
++	else
++		adapter->phy_interface = PHY_INTERFACE_MODE_RGMII;
+ }
+ 
+ static int lan743x_phy_open(struct lan743x_adapter *adapter)
+ {
++	struct net_device *netdev = adapter->netdev;
+ 	struct lan743x_phy *phy = &adapter->phy;
+-	struct phy_device *phydev = NULL;
+-	struct device_node *phynode;
+-	struct net_device *netdev;
++	struct fixed_phy_status fphy_status = {
++		.link = 1,
++		.speed = SPEED_1000,
++		.duplex = DUPLEX_FULL,
++	};
++	struct phy_device *phydev;
+ 	int ret = -EIO;
+ 
+-	netdev = adapter->netdev;
+-	phynode = of_node_get(adapter->pdev->dev.of_node);
+-
+-	if (phynode) {
+-		/* try devicetree phy, or fixed link */
+-		of_get_phy_mode(phynode, &adapter->phy_mode);
+-
+-		if (of_phy_is_fixed_link(phynode)) {
+-			ret = of_phy_register_fixed_link(phynode);
+-			if (ret) {
+-				netdev_err(netdev,
+-					   "cannot register fixed PHY\n");
+-				of_node_put(phynode);
++	/* try devicetree phy, or fixed link */
++	phydev = of_phy_get_and_connect(netdev, adapter->pdev->dev.of_node,
++					lan743x_phy_link_status_change);
++
++	if (!phydev) {
++		/* try internal phy */
++		//phydev = phy_find_first(adapter->mdiobus);
++		if (!phydev)	{
++			if (((adapter->csr.id_rev & ID_REV_ID_MASK_) ==
++			     (ID_REV_ID_LAN7431_)) || adapter->is_pci11x1x) {
++				phydev = fixed_phy_register(PHY_POLL,
++							    &fphy_status, NULL);
++				if (IS_ERR(phydev)) {
++					netdev_err(netdev, "No PHY/fixed_PHY found\n");
++					return -EIO;
++				}
++			} else {
+ 				goto return_error;
+ 			}
+ 		}
+-		phydev = of_phy_connect(netdev, phynode,
+-					lan743x_phy_link_status_change, 0,
+-					adapter->phy_mode);
+-		of_node_put(phynode);
+-	}
+ 
+-	if (!phydev) {
+-		/* try internal phy */
+-		phydev = phy_find_first(adapter->mdiobus);
+-		if (!phydev)
+-			goto return_error;
++		lan743x_phy_interface_select(adapter);
+ 
+-		adapter->phy_mode = PHY_INTERFACE_MODE_GMII;
+ 		ret = phy_connect_direct(netdev, phydev,
+ 					 lan743x_phy_link_status_change,
+-					 adapter->phy_mode);
++					 adapter->phy_interface);
+ 		if (ret)
+ 			goto return_error;
+ 	}
+@@ -1060,6 +1141,7 @@ static int lan743x_phy_open(struct lan743x_adapter *adapter)
+ 
+ 	phy_start(phydev);
+ 	phy_start_aneg(phydev);
++	phy_attached_info(phydev);
+ 	return 0;
+ 
+ return_error:
+@@ -1122,6 +1204,9 @@ static void lan743x_rfe_set_multicast(struct lan743x_adapter *adapter)
+ 			rfctl |= RFE_CTL_AM_;
+ 	}
+ 
++	if (netdev->features & NETIF_F_RXCSUM)
++		rfctl |= RFE_CTL_IP_COE_ | RFE_CTL_TCP_UDP_COE_;
++
+ 	memset(hash_table, 0, DP_SEL_VHF_HASH_LEN * sizeof(u32));
+ 	if (netdev_mc_count(netdev)) {
+ 		struct netdev_hw_addr *ha;
+@@ -1603,11 +1688,13 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
+ {
+ 	int required_number_of_descriptors = 0;
+ 	unsigned int start_frame_length = 0;
++	netdev_tx_t retval = NETDEV_TX_OK;
+ 	unsigned int frame_length = 0;
+ 	unsigned int head_length = 0;
+ 	unsigned long irq_flags = 0;
+ 	bool do_timestamp = false;
+ 	bool ignore_sync = false;
++	struct netdev_queue *txq;
+ 	int nr_frags = 0;
+ 	bool gso = false;
+ 	int j;
+@@ -1620,9 +1707,12 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
+ 		if (required_number_of_descriptors > (tx->ring_size - 1)) {
+ 			dev_kfree_skb_irq(skb);
+ 		} else {
+-			/* save to overflow buffer */
+-			tx->overflow_skb = skb;
+-			netif_stop_queue(tx->adapter->netdev);
++			/* save how many descriptors we needed to restart the queue */
++			tx->rqd_descriptors = required_number_of_descriptors;
++			retval = NETDEV_TX_BUSY;
++			txq = netdev_get_tx_queue(tx->adapter->netdev,
++						  tx->channel_number);
++			netif_tx_stop_queue(txq);
+ 		}
+ 		goto unlock;
+ 	}
+@@ -1654,6 +1744,7 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
+ 		dev_kfree_skb_irq(skb);
+ 		goto unlock;
+ 	}
++	tx->frame_count++;
+ 
+ 	if (gso)
+ 		lan743x_tx_frame_add_lso(tx, frame_length, nr_frags);
+@@ -1680,15 +1771,15 @@ static netdev_tx_t lan743x_tx_xmit_frame(struct lan743x_tx *tx,
+ 
+ unlock:
+ 	spin_unlock_irqrestore(&tx->ring_lock, irq_flags);
+-	return NETDEV_TX_OK;
++	return retval;
+ }
+ 
+ static int lan743x_tx_napi_poll(struct napi_struct *napi, int weight)
+ {
+ 	struct lan743x_tx *tx = container_of(napi, struct lan743x_tx, napi);
+ 	struct lan743x_adapter *adapter = tx->adapter;
+-	bool start_transmitter = false;
+ 	unsigned long irq_flags = 0;
++	struct netdev_queue *txq;
+ 	u32 ioc_bit = 0;
+ 
+ 	ioc_bit = DMAC_INT_BIT_TX_IOC_(tx->channel_number);
+@@ -1699,24 +1790,20 @@ static int lan743x_tx_napi_poll(struct napi_struct *napi, int weight)
+ 
+ 	/* clean up tx ring */
+ 	lan743x_tx_release_completed_descriptors(tx);
+-	if (netif_queue_stopped(adapter->netdev)) {
+-		if (tx->overflow_skb) {
+-			if (lan743x_tx_get_desc_cnt(tx, tx->overflow_skb) <=
+-				lan743x_tx_get_avail_desc(tx))
+-				start_transmitter = true;
++	txq = netdev_get_tx_queue(adapter->netdev, tx->channel_number);
++	if (netif_tx_queue_stopped(txq)) {
++		if (tx->rqd_descriptors) {
++			if (tx->rqd_descriptors <=
++				lan743x_tx_get_avail_desc(tx)) {
++				tx->rqd_descriptors = 0;
++				netif_tx_wake_queue(txq);
++			}
+ 		} else {
+-			netif_wake_queue(adapter->netdev);
++			netif_tx_wake_queue(txq);
+ 		}
+ 	}
+ 	spin_unlock_irqrestore(&tx->ring_lock, irq_flags);
+ 
+-	if (start_transmitter) {
+-		/* space is now available, transmit overflow skb */
+-		lan743x_tx_xmit_frame(tx, tx->overflow_skb);
+-		tx->overflow_skb = NULL;
+-		netif_wake_queue(adapter->netdev);
+-	}
+-
+ 	if (!napi_complete(napi))
+ 		goto done;
+ 
+@@ -1766,13 +1853,10 @@ static int lan743x_tx_ring_init(struct lan743x_tx *tx)
+ 	}
+ 	if (dma_set_mask_and_coherent(&tx->adapter->pdev->dev,
+ 				      DMA_BIT_MASK(64))) {
+-		if (dma_set_mask_and_coherent(&tx->adapter->pdev->dev,
+-					      DMA_BIT_MASK(32))) {
+-			dev_warn(&tx->adapter->pdev->dev,
+-				 "lan743x_: No suitable DMA available\n");
+-			ret = -ENOMEM;
+-			goto cleanup;
+-		}
++		dev_warn(&tx->adapter->pdev->dev,
++			 "lan743x_: No suitable DMA available\n");
++		ret = -ENOMEM;
++		goto cleanup;
+ 	}
+ 	ring_allocation_size = ALIGN(tx->ring_size *
+ 				     sizeof(struct lan743x_tx_descriptor),
+@@ -1843,10 +1927,7 @@ static void lan743x_tx_close(struct lan743x_tx *tx)
+ 
+ 	lan743x_tx_release_all_descriptors(tx);
+ 
+-	if (tx->overflow_skb) {
+-		dev_kfree_skb(tx->overflow_skb);
+-		tx->overflow_skb = NULL;
+-	}
++	tx->rqd_descriptors = 0;
+ 
+ 	lan743x_tx_ring_cleanup(tx);
+ }
+@@ -1926,7 +2007,7 @@ static int lan743x_tx_open(struct lan743x_tx *tx)
+ 							 (tx->channel_number));
+ 	netif_tx_napi_add(adapter->netdev,
+ 			  &tx->napi, lan743x_tx_napi_poll,
+-			  tx->ring_size - 1);
++			  NAPI_POLL_WEIGHT);
+ 	napi_enable(&tx->napi);
+ 
+ 	data = 0;
+@@ -1957,15 +2038,6 @@ static int lan743x_rx_next_index(struct lan743x_rx *rx, int index)
+ 	return ((++index) % rx->ring_size);
+ }
+ 
+-static struct sk_buff *lan743x_rx_allocate_skb(struct lan743x_rx *rx, gfp_t gfp)
+-{
+-	int length = 0;
+-
+-	length = (LAN743X_MAX_FRAME_SIZE + ETH_HLEN + 4 + RX_HEAD_PADDING);
+-	return __netdev_alloc_skb(rx->adapter->netdev,
+-				  length, gfp);
+-}
+-
+ static void lan743x_rx_update_tail(struct lan743x_rx *rx, int index)
+ {
+ 	/* update the tail once per 8 descriptors */
+@@ -1975,35 +2047,57 @@ static void lan743x_rx_update_tail(struct lan743x_rx *rx, int index)
+ }
+ 
+ static int lan743x_rx_init_ring_element(struct lan743x_rx *rx, int index,
+-					struct sk_buff *skb)
++		gfp_t gfp)
+ {
++	struct net_device *netdev = rx->adapter->netdev;
++	struct device *dev = &rx->adapter->pdev->dev;
+ 	struct lan743x_rx_buffer_info *buffer_info;
++	unsigned int buffer_length, used_length;
+ 	struct lan743x_rx_descriptor *descriptor;
+-	int length = 0;
++	struct sk_buff *skb;
++	dma_addr_t dma_ptr;
++
++	buffer_length = netdev->mtu + ETH_HLEN + ETH_FCS_LEN + RX_HEAD_PADDING;
+ 
+-	length = (LAN743X_MAX_FRAME_SIZE + ETH_HLEN + 4 + RX_HEAD_PADDING);
+ 	descriptor = &rx->ring_cpu_ptr[index];
+ 	buffer_info = &rx->buffer_info[index];
+-	buffer_info->skb = skb;
+-	if (!(buffer_info->skb))
++	skb = __netdev_alloc_skb(netdev, buffer_length, gfp);
++	if (!skb)
+ 		return -ENOMEM;
+-	buffer_info->dma_ptr = dma_map_single(&rx->adapter->pdev->dev,
+-					      buffer_info->skb->data,
+-					      length,
+-					      DMA_FROM_DEVICE);
+-	if (dma_mapping_error(&rx->adapter->pdev->dev,
+-			      buffer_info->dma_ptr)) {
+-		buffer_info->dma_ptr = 0;
++	dma_ptr = dma_map_single(dev, skb->data, buffer_length, DMA_FROM_DEVICE);
++	if (dma_mapping_error(dev, dma_ptr)) {
++		dev_kfree_skb_any(skb);
+ 		return -ENOMEM;
+ 	}
++	if (buffer_info->dma_ptr) {
++		/* sync used area of buffer only */
++		if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_LS_)
++			/* frame length is valid only if LS bit is set.
++			 * it's a safe upper bound for the used area in this
++			 * buffer
++			 */
++			used_length = min(RX_DESC_DATA0_FRAME_LENGTH_GET_
++					(le32_to_cpu(descriptor->data0)),
++					buffer_info->buffer_length);
++		else
++			used_length = buffer_info->buffer_length;
++		dma_sync_single_for_cpu(dev, buffer_info->dma_ptr,
++					used_length,
++					DMA_FROM_DEVICE);
++		dma_unmap_single_attrs(dev, buffer_info->dma_ptr,
++				       buffer_info->buffer_length,
++				       DMA_FROM_DEVICE,
++				       DMA_ATTR_SKIP_CPU_SYNC);
++	}
+ 
+-	buffer_info->buffer_length = length;
++	buffer_info->skb = skb;
++	buffer_info->dma_ptr = dma_ptr;
++	buffer_info->buffer_length = buffer_length;
+ 	descriptor->data1 = cpu_to_le32(DMA_ADDR_LOW32(buffer_info->dma_ptr));
+ 	descriptor->data2 = cpu_to_le32(DMA_ADDR_HIGH32(buffer_info->dma_ptr));
+ 	descriptor->data3 = 0;
+ 	descriptor->data0 = cpu_to_le32((RX_DESC_DATA0_OWN_ |
+-			    (length & RX_DESC_DATA0_BUF_LENGTH_MASK_)));
+-	skb_reserve(buffer_info->skb, RX_HEAD_PADDING);
++				(buffer_length & RX_DESC_DATA0_BUF_LENGTH_MASK_)));
+ 	lan743x_rx_update_tail(rx, index);
+ 
+ 	return 0;
+@@ -2052,16 +2146,33 @@ static void lan743x_rx_release_ring_element(struct lan743x_rx *rx, int index)
+ 	memset(buffer_info, 0, sizeof(*buffer_info));
+ }
+ 
+-static int lan743x_rx_process_packet(struct lan743x_rx *rx)
++static struct sk_buff *
++lan743x_rx_trim_skb(struct sk_buff *skb, int frame_length)
++{
++	if (skb_linearize(skb)) {
++		dev_kfree_skb_irq(skb);
++		return NULL;
++	}
++	frame_length = max_t(int, 0, frame_length - ETH_FCS_LEN);
++	if (skb->len > frame_length) {
++		skb->tail -= skb->len - frame_length;
++		skb->len = frame_length;
++	}
++	return skb;
++}
++
++static int lan743x_rx_process_buffer(struct lan743x_rx *rx)
+ {
+-	struct skb_shared_hwtstamps *hwtstamps = NULL;
+-	int result = RX_PROCESS_RESULT_NOTHING_TO_DO;
+ 	int current_head_index = le32_to_cpu(*rx->head_cpu_ptr);
++	struct lan743x_rx_descriptor *descriptor, *desc_ext;
++	struct net_device *netdev = rx->adapter->netdev;
++	int result = RX_PROCESS_RESULT_NOTHING_TO_DO;
+ 	struct lan743x_rx_buffer_info *buffer_info;
+-	struct lan743x_rx_descriptor *descriptor;
++	int frame_length, buffer_length;
++	bool is_ice, is_tce, is_icsm;
+ 	int extension_index = -1;
+-	int first_index = -1;
+-	int last_index = -1;
++	bool is_last, is_first;
++	struct sk_buff *skb;
+ 
+ 	if (current_head_index < 0 || current_head_index >= rx->ring_size)
+ 		goto done;
+@@ -2069,164 +2180,128 @@ static int lan743x_rx_process_packet(struct lan743x_rx *rx)
+ 	if (rx->last_head < 0 || rx->last_head >= rx->ring_size)
+ 		goto done;
+ 
+-	if (rx->last_head != current_head_index) {
+-		descriptor = &rx->ring_cpu_ptr[rx->last_head];
+-		if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_OWN_)
+-			goto done;
+-
+-		if (!(le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_FS_))
+-			goto done;
++	if (rx->last_head == current_head_index)
++		goto done;
+ 
+-		first_index = rx->last_head;
+-		if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_LS_) {
+-			last_index = rx->last_head;
+-		} else {
+-			int index;
++	descriptor = &rx->ring_cpu_ptr[rx->last_head];
++	if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_OWN_)
++		goto done;
++	buffer_info = &rx->buffer_info[rx->last_head];
+ 
+-			index = lan743x_rx_next_index(rx, first_index);
+-			while (index != current_head_index) {
+-				descriptor = &rx->ring_cpu_ptr[index];
+-				if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_OWN_)
+-					goto done;
++	is_last = le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_LS_;
++	is_first = le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_FS_;
+ 
+-				if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_LS_) {
+-					last_index = index;
+-					break;
+-				}
+-				index = lan743x_rx_next_index(rx, index);
+-			}
+-		}
+-		if (last_index >= 0) {
+-			descriptor = &rx->ring_cpu_ptr[last_index];
+-			if (le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_EXT_) {
+-				/* extension is expected to follow */
+-				int index = lan743x_rx_next_index(rx,
+-								  last_index);
+-				if (index != current_head_index) {
+-					descriptor = &rx->ring_cpu_ptr[index];
+-					if (le32_to_cpu(descriptor->data0) &
+-					    RX_DESC_DATA0_OWN_) {
+-						goto done;
+-					}
+-					if (le32_to_cpu(descriptor->data0) &
+-					    RX_DESC_DATA0_EXT_) {
+-						extension_index = index;
+-					} else {
+-						goto done;
+-					}
+-				} else {
+-					/* extension is not yet available */
+-					/* prevent processing of this packet */
+-					first_index = -1;
+-					last_index = -1;
+-				}
+-			}
+-		}
+-	}
+-	if (first_index >= 0 && last_index >= 0) {
+-		int real_last_index = last_index;
+-		struct sk_buff *skb = NULL;
+-		u32 ts_sec = 0;
+-		u32 ts_nsec = 0;
+-
+-		/* packet is available */
+-		if (first_index == last_index) {
+-			/* single buffer packet */
+-			struct sk_buff *new_skb = NULL;
+-			int packet_length;
+-
+-			new_skb = lan743x_rx_allocate_skb(rx,
+-							  GFP_ATOMIC | GFP_DMA);
+-			if (!new_skb) {
+-				/* failed to allocate next skb.
+-				 * Memory is very low.
+-				 * Drop this packet and reuse buffer.
+-				 */
+-				lan743x_rx_reuse_ring_element(rx, first_index);
+-				goto process_extension;
+-			}
++	if (is_last && le32_to_cpu(descriptor->data0) & RX_DESC_DATA0_EXT_) {
++		/* extension is expected to follow */
++		int index = lan743x_rx_next_index(rx, rx->last_head);
+ 
+-			buffer_info = &rx->buffer_info[first_index];
+-			skb = buffer_info->skb;
+-			descriptor = &rx->ring_cpu_ptr[first_index];
+-
+-			/* unmap from dma */
+-			if (buffer_info->dma_ptr) {
+-				dma_unmap_single(&rx->adapter->pdev->dev,
+-						 buffer_info->dma_ptr,
+-						 buffer_info->buffer_length,
+-						 DMA_FROM_DEVICE);
+-				buffer_info->dma_ptr = 0;
+-				buffer_info->buffer_length = 0;
+-			}
+-			buffer_info->skb = NULL;
+-			packet_length =	RX_DESC_DATA0_FRAME_LENGTH_GET_
+-					(le32_to_cpu(descriptor->data0));
+-			skb_put(skb, packet_length - 4);
+-			skb->protocol = eth_type_trans(skb,
+-						       rx->adapter->netdev);
+-			lan743x_rx_init_ring_element(rx, first_index, new_skb);
+-		} else {
+-			int index = first_index;
++		if (index == current_head_index)
++			/* extension not yet available */
++			goto done;
++		desc_ext = &rx->ring_cpu_ptr[index];
+ 
+-			/* multi buffer packet not supported */
+-			/* this should not happen since
+-			 * buffers are allocated to be at least jumbo size
+-			 */
++		if (le32_to_cpu(desc_ext->data0) & RX_DESC_DATA0_OWN_)
++			/* extension not yet available */
++			goto done;
++		if (!(le32_to_cpu(desc_ext->data0) & RX_DESC_DATA0_EXT_))
++			goto move_forward;
++		extension_index = index;
++	}
+ 
+-			/* clean up buffers */
+-			if (first_index <= last_index) {
+-				while ((index >= first_index) &&
+-				       (index <= last_index)) {
+-					lan743x_rx_reuse_ring_element(rx,
+-								      index);
+-					index = lan743x_rx_next_index(rx,
+-								      index);
+-				}
+-			} else {
+-				while ((index >= first_index) ||
+-				       (index <= last_index)) {
+-					lan743x_rx_reuse_ring_element(rx,
+-								      index);
+-					index = lan743x_rx_next_index(rx,
+-								      index);
+-				}
+-			}
+-		}
++	/* Only the last buffer in a multi-buffer frame contains the total frame
++	 * length. The chip occasionally sends more buffers than strictly
++	 * required to reach the total frame length.
++	 * Handle this by adding all buffers to the skb in their entirety.
++	 * Once the real frame length is known, trim the skb.
++	 */
++	frame_length =
++		RX_DESC_DATA0_FRAME_LENGTH_GET_(le32_to_cpu(descriptor->data0));
++	buffer_length = buffer_info->buffer_length;
++	is_ice = le32_to_cpu(descriptor->data1) & RX_DESC_DATA1_STATUS_ICE_;
++	is_tce = le32_to_cpu(descriptor->data1) & RX_DESC_DATA1_STATUS_TCE_;
++	is_icsm = le32_to_cpu(descriptor->data1) & RX_DESC_DATA1_STATUS_ICSM_;
++
++	netdev_dbg(netdev, "%s%schunk: %d/%d",
++		   is_first ? "first " : "      ",
++		   is_last  ? "last  " : "      ",
++		   frame_length, buffer_length);
++
++	/* save existing skb, allocate new skb and map to dma */
++	skb = buffer_info->skb;
++	if (lan743x_rx_init_ring_element(rx, rx->last_head, GFP_ATOMIC | GFP_DMA)) {
++		/* failed to allocate next skb.
++		 * Memory is very low.
++		 * Drop this packet and reuse buffer.
++		 */
++		lan743x_rx_reuse_ring_element(rx, rx->last_head);
++		/* drop packet that was being assembled */
++		dev_kfree_skb_irq(rx->skb_head);
++		rx->skb_head = NULL;
++		goto process_extension;
++	}
++
++	/* add buffers to skb via skb->frag_list */
++	if (is_first) {
++		skb_reserve(skb, RX_HEAD_PADDING);
++		skb_put(skb, buffer_length - RX_HEAD_PADDING);
++		if (rx->skb_head)
++			dev_kfree_skb_irq(rx->skb_head);
++		rx->skb_head = skb;
++	} else if (rx->skb_head) {
++		skb_put(skb, buffer_length);
++		if (skb_shinfo(rx->skb_head)->frag_list)
++			rx->skb_tail->next = skb;
++		else
++			skb_shinfo(rx->skb_head)->frag_list = skb;
++		rx->skb_tail = skb;
++		rx->skb_head->len += skb->len;
++		rx->skb_head->data_len += skb->len;
++		rx->skb_head->truesize += skb->truesize;
++	} else {
++		/* packet to assemble has already been dropped because one or
++		 * more of its buffers could not be allocated
++		 */
++		netdev_dbg(netdev, "drop buffer intended for dropped packet");
++		dev_kfree_skb_irq(skb);
++	}
+ 
+ process_extension:
+-		if (extension_index >= 0) {
+-			descriptor = &rx->ring_cpu_ptr[extension_index];
+-			buffer_info = &rx->buffer_info[extension_index];
+-
+-			ts_sec = le32_to_cpu(descriptor->data1);
+-			ts_nsec = (le32_to_cpu(descriptor->data2) &
+-				  RX_DESC_DATA2_TS_NS_MASK_);
+-			lan743x_rx_reuse_ring_element(rx, extension_index);
+-			real_last_index = extension_index;
+-		}
+-
+-		if (!skb) {
+-			result = RX_PROCESS_RESULT_PACKET_DROPPED;
+-			goto move_forward;
++	if (extension_index >= 0) {
++		u32 ts_sec;
++		u32 ts_nsec;
++
++		ts_sec = le32_to_cpu(desc_ext->data1);
++		ts_nsec = (le32_to_cpu(desc_ext->data2) &
++				RX_DESC_DATA2_TS_NS_MASK_);
++		if (rx->skb_head)
++			skb_hwtstamps(rx->skb_head)->hwtstamp =
++				ktime_set(ts_sec, ts_nsec);
++		lan743x_rx_reuse_ring_element(rx, extension_index);
++		rx->last_head = extension_index;
++		netdev_dbg(netdev, "process extension");
++	}
++
++	if (is_last && rx->skb_head)
++		rx->skb_head = lan743x_rx_trim_skb(rx->skb_head, frame_length);
++
++	if (is_last && rx->skb_head) {
++		rx->skb_head->protocol = eth_type_trans(rx->skb_head,
++							rx->adapter->netdev);
++		if (rx->adapter->netdev->features & NETIF_F_RXCSUM) {
++			if (!is_ice && !is_tce && !is_icsm)
++				skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 		}
+-
+-		if (extension_index < 0)
+-			goto pass_packet_to_os;
+-		hwtstamps = skb_hwtstamps(skb);
+-		if (hwtstamps)
+-			hwtstamps->hwtstamp = ktime_set(ts_sec, ts_nsec);
+-
+-pass_packet_to_os:
+-		/* pass packet to OS */
+-		napi_gro_receive(&rx->napi, skb);
+-		result = RX_PROCESS_RESULT_PACKET_RECEIVED;
++		netdev_dbg(netdev, "sending %d byte frame to OS",
++			   rx->skb_head->len);
++		napi_gro_receive(&rx->napi, rx->skb_head);
++		rx->skb_head = NULL;
++	}
+ 
+ move_forward:
+-		/* push tail and head forward */
+-		rx->last_tail = real_last_index;
+-		rx->last_head = lan743x_rx_next_index(rx, real_last_index);
+-	}
++	/* push tail and head forward */
++	rx->last_tail = rx->last_head;
++	rx->last_head = lan743x_rx_next_index(rx, rx->last_head);
++	result = RX_PROCESS_RESULT_BUFFER_RECEIVED;
+ done:
+ 	return result;
+ }
+@@ -2245,12 +2320,12 @@ static int lan743x_rx_napi_poll(struct napi_struct *napi, int weight)
+ 				  DMAC_INT_BIT_RXFRM_(rx->channel_number));
+ 	}
+ 	for (count = 0; count < weight; count++) {
+-		result = lan743x_rx_process_packet(rx);
++		result = lan743x_rx_process_buffer(rx);
+ 		if (result == RX_PROCESS_RESULT_NOTHING_TO_DO)
+ 			break;
+ 	}
+ 	rx->frame_count += count;
+-	if (count == weight || result == RX_PROCESS_RESULT_PACKET_RECEIVED)
++	if (count == weight || result == RX_PROCESS_RESULT_BUFFER_RECEIVED)
+ 		return weight;
+ 
+ 	if (!napi_complete_done(napi, count))
+@@ -2325,13 +2400,10 @@ static int lan743x_rx_ring_init(struct lan743x_rx *rx)
+ 	}
+ 	if (dma_set_mask_and_coherent(&rx->adapter->pdev->dev,
+ 				      DMA_BIT_MASK(64))) {
+-		if (dma_set_mask_and_coherent(&rx->adapter->pdev->dev,
+-					      DMA_BIT_MASK(32))) {
+-			dev_warn(&rx->adapter->pdev->dev,
+-				 "lan743x_: No suitable DMA available\n");
+-			ret = -ENOMEM;
+-			goto cleanup;
+-		}
++		dev_warn(&rx->adapter->pdev->dev,
++			 "lan743x_: No suitable DMA available\n");
++		ret = -ENOMEM;
++		goto cleanup;
+ 	}
+ 	ring_allocation_size = ALIGN(rx->ring_size *
+ 				     sizeof(struct lan743x_rx_descriptor),
+@@ -2372,16 +2444,15 @@ static int lan743x_rx_ring_init(struct lan743x_rx *rx)
+ 
+ 	rx->last_head = 0;
+ 	for (index = 0; index < rx->ring_size; index++) {
+-		struct sk_buff *new_skb = lan743x_rx_allocate_skb(rx,
+-								   GFP_KERNEL);
+-
+-		ret = lan743x_rx_init_ring_element(rx, index, new_skb);
++		ret = lan743x_rx_init_ring_element(rx, index, GFP_KERNEL);
+ 		if (ret)
+ 			goto cleanup;
+ 	}
+ 	return 0;
+ 
+ cleanup:
++	netif_warn(rx->adapter, ifup, rx->adapter->netdev,
++		   "Error allocating memory for LAN743x\n");
+ 	lan743x_rx_ring_cleanup(rx);
+ 	return ret;
+ }
+@@ -2468,7 +2539,7 @@ static int lan743x_rx_open(struct lan743x_rx *rx)
+ 		data |= RX_CFG_B_RX_PAD_2_;
+ 	data &= ~RX_CFG_B_RX_RING_LEN_MASK_;
+ 	data |= ((rx->ring_size) & RX_CFG_B_RX_RING_LEN_MASK_);
+-	data |= RX_CFG_B_TS_ALL_RX_;
++	data |= RX_CFG_B_TS_DESCR_EN_;
+ 	if (!(adapter->csr.flags & LAN743X_CSR_FLAG_IS_A0))
+ 		data |= RX_CFG_B_RDMABL_512_;
+ 
+@@ -2537,8 +2608,8 @@ static int lan743x_netdev_close(struct net_device *netdev)
+ {
+ 	struct lan743x_adapter *adapter = netdev_priv(netdev);
+ 	int index;
+-
+-	lan743x_tx_close(&adapter->tx[0]);
++	for (index = 0; index < adapter->used_tx_channels; index++)
++		lan743x_tx_close(&adapter->tx[index]);
+ 
+ 	for (index = 0; index < LAN743X_USED_RX_CHANNELS; index++)
+ 		lan743x_rx_close(&adapter->rx[index]);
+@@ -2584,12 +2655,19 @@ static int lan743x_netdev_open(struct net_device *netdev)
+ 			goto close_rx;
+ 	}
+ 
+-	ret = lan743x_tx_open(&adapter->tx[0]);
+-	if (ret)
+-		goto close_rx;
+-
++	for (index = 0; index < adapter->used_tx_channels; index++) {
++		ret = lan743x_tx_open(&adapter->tx[index]);
++		if (ret)
++			goto close_tx;
++	}
+ 	return 0;
+ 
++close_tx:
++	for (index = 0; index < adapter->used_tx_channels; index++) {
++		if (adapter->tx[index].ring_cpu_ptr)
++			lan743x_tx_close(&adapter->tx[index]);
++	}
++
+ close_rx:
+ 	for (index = 0; index < LAN743X_USED_RX_CHANNELS; index++) {
+ 		if (adapter->rx[index].ring_cpu_ptr)
+@@ -2616,8 +2694,12 @@ static netdev_tx_t lan743x_netdev_xmit_frame(struct sk_buff *skb,
+ 					     struct net_device *netdev)
+ {
+ 	struct lan743x_adapter *adapter = netdev_priv(netdev);
++	u8 ch = 0;
++
++	if (adapter->is_pci11x1x)
++		ch = skb->queue_mapping % PCI11X1X_USED_TX_CHANNELS;
+ 
+-	return lan743x_tx_xmit_frame(&adapter->tx[0], skb);
++	return lan743x_tx_xmit_frame(&adapter->tx[ch], skb);
+ }
+ 
+ static int lan743x_netdev_ioctl(struct net_device *netdev,
+@@ -2748,6 +2830,20 @@ static int lan743x_hardware_init(struct lan743x_adapter *adapter,
+ 	int index;
+ 	int ret;
+ 
++	adapter->is_pci11x1x = is_pci11x1x_chip(adapter);
++	if (adapter->is_pci11x1x) {
++		adapter->max_tx_channels = PCI11X1X_MAX_TX_CHANNELS;
++		adapter->used_tx_channels = PCI11X1X_USED_TX_CHANNELS;
++		adapter->max_vector_count = PCI11X1X_MAX_VECTOR_COUNT;
++		pci11x1x_strap_get_status(adapter);
++		spin_lock_init(&adapter->eth_syslock_spinlock);
++		mutex_init(&adapter->sgmii_rw_lock);
++	} else {
++		adapter->max_tx_channels = LAN743X_MAX_TX_CHANNELS;
++		adapter->used_tx_channels = LAN743X_USED_TX_CHANNELS;
++		adapter->max_vector_count = LAN743X_MAX_VECTOR_COUNT;
++	}
++
+ 	adapter->intr.irq = adapter->pdev->irq;
+ 	lan743x_csr_write(adapter, INT_EN_CLR, 0xFFFFFFFF);
+ 
+@@ -2777,16 +2873,19 @@ static int lan743x_hardware_init(struct lan743x_adapter *adapter,
+ 		adapter->rx[index].adapter = adapter;
+ 		adapter->rx[index].channel_number = index;
+ 	}
++	for (index = 0; index < adapter->used_tx_channels; index++) {
++		tx = &adapter->tx[index];
++		tx->adapter = adapter;
++		tx->channel_number = index;
++		spin_lock_init(&tx->ring_lock);
++	}
+ 
+-	tx = &adapter->tx[0];
+-	tx->adapter = adapter;
+-	tx->channel_number = 0;
+-	spin_lock_init(&tx->ring_lock);
+ 	return 0;
+ }
+ 
+ static int lan743x_mdiobus_init(struct lan743x_adapter *adapter)
+ {
++	u32 sgmii_ctl;
+ 	int ret;
+ 
+ 	adapter->mdiobus = devm_mdiobus_alloc(&adapter->pdev->dev);
+@@ -2796,9 +2895,26 @@ static int lan743x_mdiobus_init(struct lan743x_adapter *adapter)
+ 	}
+ 
+ 	adapter->mdiobus->priv = (void *)adapter;
+-	adapter->mdiobus->read = lan743x_mdiobus_read;
+-	adapter->mdiobus->write = lan743x_mdiobus_write;
+-	adapter->mdiobus->name = "lan743x-mdiobus";
++
++	if (adapter->is_pci11x1x) {
++		sgmii_ctl = lan743x_csr_read(adapter, SGMII_CTL);
++		sgmii_ctl &= ~SGMII_CTL_SGMII_ENABLE_;
++		sgmii_ctl |= SGMII_CTL_SGMII_POWER_DN_;
++		lan743x_csr_write(adapter, SGMII_CTL, sgmii_ctl);
++		netif_dbg(adapter, drv, adapter->netdev,
++			  "RGMII operation\n");
++		/* RGMII I/F */
++		adapter->mdiobus->read = lan743x_mdiobus_read;
++		adapter->mdiobus->write = lan743x_mdiobus_write;
++		adapter->mdiobus->name = "lan743x-mdiobus";
++		netif_dbg(adapter, drv, adapter->netdev,
++			  "lan743x-mdiobus\n");
++	} else {
++		adapter->mdiobus->read = lan743x_mdiobus_read;
++		adapter->mdiobus->write = lan743x_mdiobus_write;
++		adapter->mdiobus->name = "lan743x-mdiobus";
++	}
++
+ 	snprintf(adapter->mdiobus->id, MII_BUS_ID_SIZE,
+ 		 "pci-%s", pci_name(adapter->pdev));
+ 
+@@ -2833,9 +2949,18 @@ static int lan743x_pcidev_probe(struct pci_dev *pdev,
+ 	struct net_device *netdev = NULL;
+ 	const void *mac_addr;
+ 	int ret = -ENODEV;
++	if (id->device == PCI_DEVICE_ID_SMSC_A011 || id->device == PCI_DEVICE_ID_SMSC_A041) {
++		netdev = devm_alloc_etherdev_mqs(&pdev->dev,
++						 sizeof(struct lan743x_adapter),
++						 PCI11X1X_USED_TX_CHANNELS,
++						 LAN743X_USED_RX_CHANNELS);
++	} else {
++		netdev = devm_alloc_etherdev_mqs(&pdev->dev,
++						 sizeof(struct lan743x_adapter),
++						 LAN743X_USED_TX_CHANNELS,
++						 LAN743X_USED_RX_CHANNELS);
++	}
+ 
+-	netdev = devm_alloc_etherdev(&pdev->dev,
+-				     sizeof(struct lan743x_adapter));
+ 	if (!netdev)
+ 		goto return_error;
+ 
+@@ -2846,16 +2971,16 @@ static int lan743x_pcidev_probe(struct pci_dev *pdev,
+ 	adapter->msg_enable = NETIF_MSG_DRV | NETIF_MSG_PROBE |
+ 			      NETIF_MSG_LINK | NETIF_MSG_IFUP |
+ 			      NETIF_MSG_IFDOWN | NETIF_MSG_TX_QUEUED;
++
+ 	netdev->max_mtu = LAN743X_MAX_FRAME_SIZE;
+ 
+ 	mac_addr = of_get_mac_address(pdev->dev.of_node);
++
+ 	if (!IS_ERR(mac_addr))
+ 		ether_addr_copy(adapter->mac_address, mac_addr);
+-
+ 	ret = lan743x_pci_init(adapter, pdev);
+ 	if (ret)
+ 		goto return_error;
+-
+ 	ret = lan743x_csr_init(adapter);
+ 	if (ret)
+ 		goto cleanup_pci;
+@@ -2867,16 +2992,16 @@ static int lan743x_pcidev_probe(struct pci_dev *pdev,
+ 	ret = lan743x_mdiobus_init(adapter);
+ 	if (ret)
+ 		goto cleanup_hardware;
+-
+ 	adapter->netdev->netdev_ops = &lan743x_netdev_ops;
+ 	adapter->netdev->ethtool_ops = &lan743x_ethtool_ops;
+-	adapter->netdev->features = NETIF_F_SG | NETIF_F_TSO | NETIF_F_HW_CSUM;
++	adapter->netdev->features = NETIF_F_SG | NETIF_F_TSO | NETIF_F_HW_CSUM | NETIF_F_RXCSUM;
+ 	adapter->netdev->hw_features = adapter->netdev->features;
+ 
+ 	/* carrier off reporting is important to ethtool even BEFORE open */
+ 	netif_carrier_off(netdev);
+ 
+ 	ret = register_netdev(adapter->netdev);
++
+ 	if (ret < 0)
+ 		goto cleanup_mdiobus;
+ 	return 0;
+@@ -2948,6 +3073,7 @@ static void lan743x_pm_set_wol(struct lan743x_adapter *adapter)
+ 	const u8 ipv6_multicast[3] = { 0x33, 0x33 };
+ 	const u8 arp_type[2] = { 0x08, 0x06 };
+ 	int mask_index;
++	u32 sopass;
+ 	u32 pmtctl;
+ 	u32 wucsr;
+ 	u32 macrx;
+@@ -3042,6 +3168,14 @@ static void lan743x_pm_set_wol(struct lan743x_adapter *adapter)
+ 		pmtctl |= PMT_CTL_RX_FCT_RFE_D3_CLK_OVR_;
+ 	}
+ 
++	if (adapter->wolopts & WAKE_MAGICSECURE) {
++		sopass = *(u32 *)adapter->sopass;
++		lan743x_csr_write(adapter, MAC_MP_SO_LO, sopass);
++		sopass = *(u16 *)&adapter->sopass[4];
++		lan743x_csr_write(adapter, MAC_MP_SO_HI, sopass);
++		wucsr |= MAC_MP_SO_EN_;
++	}
++
+ 	lan743x_csr_write(adapter, MAC_WUCSR, wucsr);
+ 	lan743x_csr_write(adapter, PMT_CTL, pmtctl);
+ 	lan743x_csr_write(adapter, MAC_RX, macrx);
+@@ -3052,6 +3186,7 @@ static int lan743x_pm_suspend(struct device *dev)
+ 	struct pci_dev *pdev = to_pci_dev(dev);
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct lan743x_adapter *adapter = netdev_priv(netdev);
++	u32 data;
+ 
+ 	lan743x_pcidev_shutdown(pdev);
+ 
+@@ -3063,8 +3198,19 @@ static int lan743x_pm_suspend(struct device *dev)
+ 	if (adapter->wolopts)
+ 		lan743x_pm_set_wol(adapter);
+ 
++	if (adapter->is_pci11x1x) {
++		/* Save HW_CFG to config again in PM resume */
++		data = lan743x_csr_read(adapter, HW_CFG);
++		adapter->hw_cfg = data;
++		data |= (HW_CFG_RST_PROTECT_PCIE_ |
++				HW_CFG_D3_RESET_DIS_ |
++				HW_CFG_D3_VAUX_OVR_ |
++				HW_CFG_HOT_RESET_DIS_ |
++				HW_CFG_RST_PROTECT_);
++		lan743x_csr_write(adapter, HW_CFG, data);
++	}
+ 	/* Host sets PME_En, put D3hot */
+-	return pci_prepare_to_sleep(pdev);;
++	return pci_prepare_to_sleep(pdev);
+ }
+ 
+ static int lan743x_pm_resume(struct device *dev)
+@@ -3078,6 +3224,10 @@ static int lan743x_pm_resume(struct device *dev)
+ 	pci_restore_state(pdev);
+ 	pci_save_state(pdev);
+ 
++	/* Restore HW_CFG that was saved during pm suspend */
++	if (adapter->is_pci11x1x)
++		lan743x_csr_write(adapter, HW_CFG, adapter->hw_cfg);
++
+ 	ret = lan743x_hardware_init(adapter, pdev);
+ 	if (ret) {
+ 		netif_err(adapter, probe, adapter->netdev,
+@@ -3094,6 +3244,9 @@ static int lan743x_pm_resume(struct device *dev)
+ 		lan743x_netdev_open(netdev);
+ 
+ 	netif_device_attach(netdev);
++	ret = lan743x_csr_read(adapter, MAC_WK_SRC);
++	netif_info(adapter, drv, adapter->netdev,
++		   "Wakeup source : 0x%08X\n", ret);
+ 
+ 	return 0;
+ }
+@@ -3106,6 +3259,8 @@ static const struct dev_pm_ops lan743x_pm_ops = {
+ static const struct pci_device_id lan743x_pcidev_tbl[] = {
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SMSC, PCI_DEVICE_ID_SMSC_LAN7430) },
+ 	{ PCI_DEVICE(PCI_VENDOR_ID_SMSC, PCI_DEVICE_ID_SMSC_LAN7431) },
++	{ PCI_DEVICE(PCI_VENDOR_ID_SMSC, PCI_DEVICE_ID_SMSC_A011) },
++	{ PCI_DEVICE(PCI_VENDOR_ID_SMSC, PCI_DEVICE_ID_SMSC_A041) },
+ 	{ 0, }
+ };
+ 
+diff --git a/drivers/net/ethernet/microchip/lan743x_main.h b/drivers/net/ethernet/microchip/lan743x_main.h
+index 751f2bc9c..1a90cb4fc 100644
+--- a/drivers/net/ethernet/microchip/lan743x_main.h
++++ b/drivers/net/ethernet/microchip/lan743x_main.h
+@@ -16,8 +16,13 @@
+ #define ID_REV_ID_MASK_			(0xFFFF0000)
+ #define ID_REV_ID_LAN7430_		(0x74300000)
+ #define ID_REV_ID_LAN7431_		(0x74310000)
++#define ID_REV_ID_LAN743X_		(0x74300000)
++#define ID_REV_ID_A011_			(0xA0110000)	// PCI11010
++#define ID_REV_ID_A041_			(0xA0410000)	// PCI11414
++#define ID_REV_ID_A0X1_			(0xA0010000)
+ #define ID_REV_IS_VALID_CHIP_ID_(id_rev)	\
+-	(((id_rev) & 0xFFF00000) == 0x74300000)
++	((((id_rev) & 0xFFF00000) == ID_REV_ID_LAN743X_) || \
++	 (((id_rev) & 0xFF0F0000) == ID_REV_ID_A0X1_))
+ #define ID_REV_CHIP_REV_MASK_		(0x0000FFFF)
+ #define ID_REV_CHIP_REV_A0_		(0x00000000)
+ #define ID_REV_CHIP_REV_B0_		(0x00000010)
+@@ -25,8 +30,24 @@
+ #define FPGA_REV			(0x04)
+ #define FPGA_REV_GET_MINOR_(fpga_rev)	(((fpga_rev) >> 8) & 0x000000FF)
+ #define FPGA_REV_GET_MAJOR_(fpga_rev)	((fpga_rev) & 0x000000FF)
++#define FPGA_SGMII_OP			BIT(24)
++
++#define STRAP_READ			(0x0C)
++#define STRAP_READ_USE_SGMII_EN_	BIT(22)
++#define STRAP_READ_SGMII_EN_		BIT(6)
++#define STRAP_READ_SGMII_REFCLK_	BIT(5)
++#define STRAP_READ_SGMII_2_5G_		BIT(4)
++#define STRAP_READ_BASE_X_		BIT(3)
++#define STRAP_READ_RGMII_TXC_DELAY_EN_	BIT(2)
++#define STRAP_READ_RGMII_RXC_DELAY_EN_	BIT(1)
++#define STRAP_READ_ADV_PM_DISABLE_	BIT(0)
+ 
+ #define HW_CFG					(0x010)
++#define HW_CFG_RST_PROTECT_PCIE_		BIT(19)
++#define HW_CFG_HOT_RESET_DIS_			BIT(15)
++#define HW_CFG_D3_VAUX_OVR_			BIT(14)
++#define HW_CFG_D3_RESET_DIS_			BIT(13)
++#define HW_CFG_RST_PROTECT_			BIT(12)
+ #define HW_CFG_RELOAD_TYPE_ALL_			(0x00000FC0)
+ #define HW_CFG_EE_OTP_RELOAD_			BIT(4)
+ #define HW_CFG_LRST_				BIT(1)
+@@ -70,6 +91,45 @@
+ 
+ #define E2P_DATA			(0x044)
+ 
++/* Hearthstone top level & System Reg Addresses */
++#define ETH_CTRL_REG_ADDR_BASE		(0x0000)
++#define ETH_SYS_REG_ADDR_BASE		(0x4000)
++#define CONFIG_REG_ADDR_BASE		(0x0000)
++#define ETH_EEPROM_REG_ADDR_BASE	(0x0E00)
++#define ETH_OTP_REG_ADDR_BASE		(0x1000)
++#define GEN_SYS_CONFIG_LOAD_STARTED_REG	(0x0078)
++#define ETH_SYS_CONFIG_LOAD_STARTED_REG (ETH_SYS_REG_ADDR_BASE + \
++		CONFIG_REG_ADDR_BASE +                           \
++		GEN_SYS_CONFIG_LOAD_STARTED_REG)
++#define GEN_SYS_LOAD_STARTED_REG_ETH_	BIT(4)
++#define SYS_LOCK_REG			(0x00A0)
++#define SYS_LOCK_REG_MAIN_LOCK_		BIT(7)
++#define SYS_LOCK_REG_GEN_PERI_LOCK_	BIT(5)
++#define SYS_LOCK_REG_SPI_PERI_LOCK_	BIT(4)
++#define SYS_LOCK_REG_SMBUS_PERI_LOCK_	BIT(3)
++#define SYS_LOCK_REG_UART_SS_LOCK_	BIT(2)
++#define SYS_LOCK_REG_ENET_SS_LOCK_	BIT(1)
++#define SYS_LOCK_REG_USB_SS_LOCK_	BIT(0)
++#define ETH_SYSTEM_SYS_LOCK_REG		(ETH_SYS_REG_ADDR_BASE + \
++		CONFIG_REG_ADDR_BASE +                           \
++		SYS_LOCK_REG)
++#define HS_EEPROM_REG_ADDR_BASE		(ETH_SYS_REG_ADDR_BASE + \
++							 ETH_EEPROM_REG_ADDR_BASE)
++#define HS_E2P_CMD			(HS_EEPROM_REG_ADDR_BASE + 0x0000)
++#define HS_E2P_CMD_EPC_BUSY_		BIT(31)
++#define HS_E2P_CMD_EPC_CMD_WRITE_	GENMASK(29, 28)
++#define HS_E2P_CMD_EPC_CMD_READ_	(0x0)
++#define HS_E2P_CMD_EPC_TIMEOUT_		BIT(17)
++#define HS_E2P_CMD_EPC_ADDR_MASK_	GENMASK(15, 0)
++#define HS_E2P_DATA			(HS_EEPROM_REG_ADDR_BASE + 0x0004)
++#define HS_E2P_DATA_MASK_		GENMASK(7, 0)
++#define HS_E2P_CFG			(HS_EEPROM_REG_ADDR_BASE + 0x0008)
++#define HS_E2P_CFG_I2C_PULSE_MASK_	GENMASK(19, 16)
++#define HS_E2P_CFG_EEPROM_SIZE_SEL_	BIT(12)
++#define HS_E2P_CFG_I2C_BAUD_RATE_MASK_	GENMASK(9, 8)
++#define HS_E2P_CFG_TEST_EEPR_TO_BYP_	BIT(0)
++#define HS_E2P_PAD_CTL			(HS_EEPROM_REG_ADDR_BASE + 0x000C)
++
+ #define GPIO_CFG0			(0x050)
+ #define GPIO_CFG0_GPIO_DIR_BIT_(bit)	BIT(16 + (bit))
+ #define GPIO_CFG0_GPIO_DATA_BIT_(bit)	BIT(0 + (bit))
+@@ -135,6 +195,13 @@
+ #define MAC_RX_ADDRL			(0x11C)
+ 
+ #define MAC_MII_ACC			(0x120)
++#define MAC_MII_ACC_MDC_CYCLE_SHIFT_	(16)
++#define MAC_MII_ACC_MDC_CYCLE_MASK_	(0x00070000)
++#define MAC_MII_ACC_MDC_CYCLE_2_5MHZ_	(0)
++#define MAC_MII_ACC_MDC_CYCLE_5MHZ_	(1)
++#define MAC_MII_ACC_MDC_CYCLE_12_5MHZ_	(2)
++#define MAC_MII_ACC_MDC_CYCLE_25MHZ_	(3)
++#define MAC_MII_ACC_MDC_CYCLE_1_25MHZ_	(4)
+ #define MAC_MII_ACC_PHY_ADDR_SHIFT_	(11)
+ #define MAC_MII_ACC_PHY_ADDR_MASK_	(0x0000F800)
+ #define MAC_MII_ACC_MIIRINDA_SHIFT_	(6)
+@@ -143,11 +210,21 @@
+ #define MAC_MII_ACC_MII_WRITE_		(0x00000002)
+ #define MAC_MII_ACC_MII_BUSY_		BIT(0)
+ 
++#define MAC_MII_ACC_MIIMMD_SHIFT_	(6)
++#define MAC_MII_ACC_MIIMMD_MASK_	(0x000007C0)
++#define MAC_MII_ACC_MIICL45_		BIT(3)
++#define MAC_MII_ACC_MIICMD_MASK_	(0x00000006)
++#define MAC_MII_ACC_MIICMD_ADDR_	(0x00000000)
++#define MAC_MII_ACC_MIICMD_WRITE_	(0x00000002)
++#define MAC_MII_ACC_MIICMD_READ_	(0x00000004)
++#define MAC_MII_ACC_MIICMD_READ_INC_	(0x00000006)
++
+ #define MAC_MII_DATA			(0x124)
+ 
+ #define MAC_EEE_TX_LPI_REQ_DLY_CNT		(0x130)
+ 
+ #define MAC_WUCSR				(0x140)
++#define MAC_MP_SO_EN_				BIT(21)
+ #define MAC_WUCSR_RFE_WAKE_EN_			BIT(14)
+ #define MAC_WUCSR_PFDA_EN_			BIT(3)
+ #define MAC_WUCSR_WAKE_EN_			BIT(2)
+@@ -155,6 +232,8 @@
+ #define MAC_WUCSR_BCST_EN_			BIT(0)
+ 
+ #define MAC_WK_SRC				(0x144)
++#define MAC_MP_SO_HI				(0x148)
++#define MAC_MP_SO_LO				(0x14C)
+ 
+ #define MAC_WUF_CFG0			(0x150)
+ #define MAC_NUM_OF_WUF_CFG		(32)
+@@ -187,6 +266,8 @@
+ #define RFE_ADDR_FILT_LO(x)		(0x404 + (8 * (x)))
+ 
+ #define RFE_CTL				(0x508)
++#define RFE_CTL_TCP_UDP_COE_		BIT(12)
++#define RFE_CTL_IP_COE_			BIT(11)
+ #define RFE_CTL_AB_			BIT(10)
+ #define RFE_CTL_AM_			BIT(9)
+ #define RFE_CTL_AU_			BIT(8)
+@@ -214,6 +295,82 @@
+ 
+ #define MAC_WUCSR2			(0x600)
+ 
++#define SGMII_ACC			(0x720)
++#define SGMII_ACC_SGMII_BZY_		BIT(31)
++#define SGMII_ACC_SGMII_WR_		BIT(30)
++#define SGMII_ACC_SGMII_MMD_SHIFT_	(16)
++#define SGMII_ACC_SGMII_MMD_MASK_	GENMASK(20, 16)
++#define SGMII_ACC_SGMII_MMD_VSR_	BIT(15)
++#define SGMII_ACC_SGMII_ADDR_SHIFT_	(0)
++#define SGMII_ACC_SGMII_ADDR_MASK_	GENMASK(15, 0)
++#define SGMII_DATA			(0x724)
++#define SGMII_DATA_SHIFT_		(0)
++#define SGMII_DATA_MASK_		GENMASK(15, 0)
++#define SGMII_CTL			(0x728)
++#define SGMII_CTL_SGMII_ENABLE_		BIT(31)
++#define SGMII_CTL_LINK_STATUS_SOURCE_	BIT(8)
++#define SGMII_CTL_SGMII_POWER_DN_	BIT(1)
++
++/* Vendor Specific SGMII MMD details */
++#define SR_VSMMD_PCS_ID1		0x0004
++#define SR_VSMMD_PCS_ID2		0x0005
++#define SR_VSMMD_STS			0x0008
++#define SR_VSMMD_CTRL			0x0009
++
++#define VR_MII_DIG_CTRL1			0x8000
++#define VR_MII_DIG_CTRL1_VR_RST_		BIT(15)
++#define VR_MII_DIG_CTRL1_R2TLBE_		BIT(14)
++#define VR_MII_DIG_CTRL1_EN_VSMMD1_		BIT(13)
++#define VR_MII_DIG_CTRL1_CS_EN_			BIT(10)
++#define VR_MII_DIG_CTRL1_MAC_AUTO_SW_		BIT(9)
++#define VR_MII_DIG_CTRL1_INIT_			BIT(8)
++#define VR_MII_DIG_CTRL1_DTXLANED_0_		BIT(4)
++#define VR_MII_DIG_CTRL1_CL37_TMR_OVR_RIDE_	BIT(3)
++#define VR_MII_DIG_CTRL1_EN_2_5G_MODE_		BIT(2)
++#define VR_MII_DIG_CTRL1_BYP_PWRUP_		BIT(1)
++#define VR_MII_DIG_CTRL1_PHY_MODE_CTRL_		BIT(0)
++#define VR_MII_AN_CTRL				0x8001
++#define VR_MII_AN_CTRL_MII_CTRL_		BIT(8)
++#define VR_MII_AN_CTRL_SGMII_LINK_STS_		BIT(4)
++#define VR_MII_AN_CTRL_TX_CONFIG_		BIT(3)
++#define VR_MII_AN_CTRL_1000BASE_X_		(0)
++#define VR_MII_AN_CTRL_SGMII_MODE_		(2)
++#define VR_MII_AN_CTRL_QSGMII_MODE_		(3)
++#define VR_MII_AN_CTRL_PCS_MODE_SHIFT_		(1)
++#define VR_MII_AN_CTRL_PCS_MODE_MASK_		GENMASK(2, 1)
++#define VR_MII_AN_CTRL_MII_AN_INTR_EN_		BIT(0)
++#define VR_MII_AN_INTR_STS			0x8002
++#define VR_MII_AN_INTR_STS_LINK_UP_		BIT(4)
++#define VR_MII_AN_INTR_STS_SPEED_MASK_		GENMASK(3, 2)
++#define VR_MII_AN_INTR_STS_1000_MBPS_		BIT(3)
++#define VR_MII_AN_INTR_STS_100_MBPS_		BIT(2)
++#define VR_MII_AN_INTR_STS_10_MBPS_		(0)
++#define VR_MII_AN_INTR_STS_FDX_			BIT(1)
++#define VR_MII_AN_INTR_STS_CL37_ANCMPLT_INTR_	BIT(0)
++
++#define VR_MII_LINK_TIMER_CTRL			0x800A
++#define VR_MII_DIG_STS                          0x8010
++#define VR_MII_DIG_STS_PSEQ_STATE_MASK_         GENMASK(4, 2)
++#define VR_MII_DIG_STS_PSEQ_STATE_POS_          (2)
++#define VR_MII_GEN2_4_MPLL_CTRL0		0x8078
++#define VR_MII_MPLL_CTRL0_REF_CLK_DIV2_		BIT(12)
++#define VR_MII_MPLL_CTRL0_USE_REFCLK_PAD_	BIT(4)
++#define VR_MII_GEN2_4_MPLL_CTRL1		0x8079
++#define VR_MII_MPLL_CTRL1_MPLL_MULTIPLIER_	GENMASK(6, 0)
++#define VR_MII_BAUD_RATE_3P125GBPS		(3125)
++#define VR_MII_BAUD_RATE_1P25GBPS		(1250)
++#define VR_MII_MPLL_MULTIPLIER_125		(125)
++#define VR_MII_MPLL_MULTIPLIER_100		(100)
++#define VR_MII_MPLL_MULTIPLIER_50		(50)
++#define VR_MII_MPLL_MULTIPLIER_40		(40)
++#define VR_MII_GEN2_4_MISC_CTRL1		0x809A
++#define VR_MII_CTRL1_RX_RATE_0_MASK_		GENMASK(3, 2)
++#define VR_MII_CTRL1_RX_RATE_0_SHIFT_		(2)
++#define VR_MII_CTRL1_TX_RATE_0_MASK_		GENMASK(1, 0)
++#define VR_MII_MPLL_BAUD_CLK			(0)
++#define VR_MII_MPLL_BAUD_CLK_DIV_2		(1)
++#define VR_MII_MPLL_BAUD_CLK_DIV_4		(2)
++
+ #define INT_STS				(0x780)
+ #define INT_BIT_DMA_RX_(channel)	BIT(24 + (channel))
+ #define INT_BIT_ALL_RX_			(0x0F000000)
+@@ -261,8 +418,11 @@
+ #define INT_MOD_CFG5			(0x7D4)
+ #define INT_MOD_CFG6			(0x7D8)
+ #define INT_MOD_CFG7			(0x7DC)
++#define INT_MOD_CFG8			(0x7E0)
++#define INT_MOD_CFG9			(0x7E4)
+ 
+ #define PTP_CMD_CTL					(0x0A00)
++#define PTP_CMD_CTL_PTP_LTC_TARGET_READ_		BIT(13)
+ #define PTP_CMD_CTL_PTP_CLK_STP_NSEC_			BIT(6)
+ #define PTP_CMD_CTL_PTP_CLOCK_STEP_SEC_			BIT(5)
+ #define PTP_CMD_CTL_PTP_CLOCK_LOAD_			BIT(4)
+@@ -279,13 +439,56 @@
+ #define PTP_GENERAL_CONFIG_CLOCK_EVENT_1MS_	(3)
+ #define PTP_GENERAL_CONFIG_CLOCK_EVENT_10MS_	(4)
+ #define PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_	(5)
++#define PTP_GENERAL_CONFIG_CLOCK_EVENT_TOGGLE_	(6)
+ #define PTP_GENERAL_CONFIG_CLOCK_EVENT_X_SET_(channel, value) \
+ 	(((value) & 0x7) << (1 + ((channel) << 2)))
+ #define PTP_GENERAL_CONFIG_RELOAD_ADD_X_(channel)	(BIT((channel) << 2))
+ 
++#define HS_PTP_GENERAL_CONFIG				(0x0A04)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_X_MASK_(channel) \
++		(0xf << (4 + ((channel) << 2)))
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100NS_	(0)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_500NS_	(1)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_1US_		(2)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_5US_		(3)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_10US_		(4)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_50US_		(5)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100US_	(6)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_500US_	(7)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_1MS_		(8)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_5MS_		(9)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_10MS_		(10)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_50MS_		(11)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100MS_	(12)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_	(13)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_TOGG_		(14)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_INT_		(15)
++#define HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_X_SET_(channel, value) \
++		(((value) & 0xf) << (4 + ((channel) << 2)))
++#define HS_PTP_GENERAL_CONFIG_EVENT_POL_X_(channel)	(BIT(1 + ((channel) * 2)))
++#define HS_PTP_GENERAL_CONFIG_RELOAD_ADD_X_(channel)	(BIT((channel) * 2))
++
+ #define PTP_INT_STS				(0x0A08)
++#define PTP_INT_IO_FE_MASK_			GENMASK(31, 24)
++#define PTP_INT_IO_FE_SHIFT_			(24)
++#define PTP_INT_IO_FE_SET_(channel)		BIT(24 + (channel))
++#define PTP_INT_IO_RE_MASK_			GENMASK(23, 16)
++#define PTP_INT_IO_RE_SHIFT_			(16)
++#define PTP_INT_IO_RE_SET_(channel)		BIT(16 + (channel))
++#define PTP_INT_TX_TS_OVRFL_INT_		BIT(14)
++#define PTP_INT_TX_SWTS_ERR_INT_		BIT(13)
++#define PTP_INT_TX_TS_INT_			BIT(12)
++#define PTP_INT_RX_TS_OVRFL_INT_		BIT(9)
++#define PTP_INT_RX_TS_INT_			BIT(8)
++#define PTP_INT_TIMER_INT_B_			BIT(1)
++#define PTP_INT_TIMER_INT_A_			BIT(0)
+ #define PTP_INT_EN_SET				(0x0A0C)
++#define PTP_INT_EN_FE_EN_SET_(channel)		BIT(24 + (channel))
++#define PTP_INT_EN_RE_EN_SET_(channel)		BIT(16 + (channel))
++#define PTP_INT_EN_TIMER_SET_(channel)		BIT(channel)
+ #define PTP_INT_EN_CLR				(0x0A10)
++#define PTP_INT_EN_FE_EN_CLR_(channel)		BIT(24 + (channel))
++#define PTP_INT_EN_RE_EN_CLR_(channel)		BIT(16 + (channel))
+ #define PTP_INT_BIT_TX_SWTS_ERR_		BIT(13)
+ #define PTP_INT_BIT_TX_TS_			BIT(12)
+ #define PTP_INT_BIT_TIMER_B_			BIT(1)
+@@ -303,12 +506,24 @@
+ #define PTP_CLOCK_TARGET_NS_X(channel)		(0x0A34 + ((channel) << 4))
+ #define PTP_CLOCK_TARGET_RELOAD_SEC_X(channel)	(0x0A38 + ((channel) << 4))
+ #define PTP_CLOCK_TARGET_RELOAD_NS_X(channel)	(0x0A3C + ((channel) << 4))
++#define PTP_LTC_SET_SEC_HI			(0x0A50)
++#define PTP_LTC_SET_SEC_HI_SEC_47_32_MASK_	GENMASK(15, 0)
++#define PTP_VERSION				(0x0A54)
++#define PTP_VERSION_TX_UP_MASK_			GENMASK(31, 24)
++#define PTP_VERSION_TX_LO_MASK_			GENMASK(23, 16)
++#define PTP_VERSION_RX_UP_MASK_			GENMASK(15, 8)
++#define PTP_VERSION_RX_LO_MASK_			GENMASK(7, 0)
++#define PTP_IO_SEL				(0x0A58)
++#define PTP_IO_SEL_MASK_			GENMASK(10, 8)
++#define PTP_IO_SEL_SHIFT_			(8)
+ #define PTP_LATENCY				(0x0A5C)
+ #define PTP_LATENCY_TX_SET_(tx_latency)		(((u32)(tx_latency)) << 16)
+ #define PTP_LATENCY_RX_SET_(rx_latency)		\
+ 	(((u32)(rx_latency)) & 0x0000FFFF)
+ #define PTP_CAP_INFO				(0x0A60)
+ #define PTP_CAP_INFO_TX_TS_CNT_GET_(reg_val)	(((reg_val) & 0x00000070) >> 4)
++#define PTP_RX_TS_CFG				(0x0A68)
++#define PTP_RX_TS_CFG_MSG_EN_ALL_		(0xFFFF)
+ 
+ #define PTP_TX_MOD				(0x0AA4)
+ #define PTP_TX_MOD_TX_PTP_SYNC_TS_INSERT_	(0x10000000)
+@@ -327,6 +542,59 @@
+ #define PTP_TX_MSG_HEADER_MSG_TYPE_		(0x000F0000)
+ #define PTP_TX_MSG_HEADER_MSG_TYPE_SYNC_	(0x00000000)
+ 
++#define PTP_TX_CAP_INFO				(0x0AB8)
++#define PTP_TX_CAP_INFO_TX_CH_MASK_		GENMASK(1, 0)
++#define PTP_TX_DOMAIN				(0x0ABC)
++#define PTP_TX_DOMAIN_MASK_			GENMASK(23, 16)
++#define PTP_TX_DOMAIN_RANGE_EN_			BIT(15)
++#define PTP_TX_DOMAIN_RANGE_MASK_		GENMASK(7, 0)
++#define PTP_TX_SDOID				(0x0AC0)
++#define PTP_TX_SDOID_MASK_			GENMASK(23, 16)
++#define PTP_TX_SDOID_RANGE_EN_			BIT(15)
++#define PTP_TX_SDOID_11_0_MASK_			GENMASK(7, 0)
++#define PTP_IO_CAP_CONFIG			(0x0AC4)
++#define PTP_IO_CAP_CONFIG_LOCK_FE_(channel)	BIT(24 + (channel))
++#define PTP_IO_CAP_CONFIG_LOCK_RE_(channel)	BIT(16 + (channel))
++#define PTP_IO_CAP_CONFIG_FE_CAP_EN_(channel)	BIT(8 + (channel))
++#define PTP_IO_CAP_CONFIG_RE_CAP_EN_(channel)	BIT(0 + (channel))
++#define PTP_IO_RE_LTC_SEC_CAP_X			(0x0AC8)
++#define PTP_IO_RE_LTC_NS_CAP_X			(0x0ACC)
++#define PTP_IO_FE_LTC_SEC_CAP_X			(0x0AD0)
++#define PTP_IO_FE_LTC_NS_CAP_X			(0x0AD4)
++#define PTP_IO_EVENT_OUTPUT_CFG			(0x0AD8)
++#define PTP_IO_EVENT_OUTPUT_CFG_SEL_(channel)	BIT(16 + (channel))
++#define PTP_IO_EVENT_OUTPUT_CFG_EN_(channel)	BIT(0 + (channel))
++#define PTP_IO_PIN_CFG				(0x0ADC)
++#define PTP_IO_PIN_CFG_OBUF_TYPE_(channel)	BIT(0 + (channel))
++#define PTP_LTC_RD_SEC_HI			(0x0AF0)
++#define PTP_LTC_RD_SEC_HI_SEC_47_32_MASK_	GENMASK(15, 0)
++#define PTP_LTC_RD_SEC_LO			(0x0AF4)
++#define PTP_LTC_RD_NS				(0x0AF8)
++#define PTP_LTC_RD_NS_29_0_MASK_		GENMASK(29, 0)
++#define PTP_LTC_RD_SUBNS			(0x0AFC)
++#define PTP_RX_USER_MAC_HI			(0x0B00)
++#define PTP_RX_USER_MAC_HI_47_32_MASK_		GENMASK(15, 0)
++#define PTP_RX_USER_MAC_LO			(0x0B04)
++#define PTP_RX_USER_IP_ADDR_0			(0x0B20)
++#define PTP_RX_USER_IP_ADDR_1			(0x0B24)
++#define PTP_RX_USER_IP_ADDR_2			(0x0B28)
++#define PTP_RX_USER_IP_ADDR_3			(0x0B2C)
++#define PTP_RX_USER_IP_MASK_0			(0x0B30)
++#define PTP_RX_USER_IP_MASK_1			(0x0B34)
++#define PTP_RX_USER_IP_MASK_2			(0x0B38)
++#define PTP_RX_USER_IP_MASK_3			(0x0B3C)
++#define PTP_TX_USER_MAC_HI			(0x0B40)
++#define PTP_TX_USER_MAC_HI_47_32_MASK_		GENMASK(15, 0)
++#define PTP_TX_USER_MAC_LO			(0x0B44)
++#define PTP_TX_USER_IP_ADDR_0			(0x0B60)
++#define PTP_TX_USER_IP_ADDR_1			(0x0B64)
++#define PTP_TX_USER_IP_ADDR_2			(0x0B68)
++#define PTP_TX_USER_IP_ADDR_3			(0x0B6C)
++#define PTP_TX_USER_IP_MASK_0			(0x0B70)
++#define PTP_TX_USER_IP_MASK_1			(0x0B74)
++#define PTP_TX_USER_IP_MASK_2			(0x0B78)
++#define PTP_TX_USER_IP_MASK_3			(0x0B7C)
++
+ #define DMAC_CFG				(0xC00)
+ #define DMAC_CFG_COAL_EN_			BIT(16)
+ #define DMAC_CFG_CH_ARB_SEL_RX_HIGH_		(0x00000000)
+@@ -391,6 +659,7 @@
+ 
+ #define RX_CFG_B(channel)			(0xC44 + ((channel) << 6))
+ #define RX_CFG_B_TS_ALL_RX_			BIT(29)
++#define RX_CFG_B_TS_DESCR_EN_			BIT(28)
+ #define RX_CFG_B_RX_PAD_MASK_			(0x03000000)
+ #define RX_CFG_B_RX_PAD_0_			(0x00000000)
+ #define RX_CFG_B_RX_PAD_2_			(0x02000000)
+@@ -482,6 +751,20 @@
+ #define OTP_STATUS				(0x1030)
+ #define OTP_STATUS_BUSY_			BIT(0)
+ 
++/* Hearthstone OTP block registers */
++#define HS_OTP_BLOCK_BASE			(ETH_SYS_REG_ADDR_BASE + \
++								 ETH_OTP_REG_ADDR_BASE)
++#define HS_OTP_PWR_DN				(HS_OTP_BLOCK_BASE + 0x0)
++#define HS_OTP_ADDR_HIGH			(HS_OTP_BLOCK_BASE + 0x4)
++#define HS_OTP_ADDR_LOW				(HS_OTP_BLOCK_BASE + 0x8)
++#define HS_OTP_PRGM_DATA			(HS_OTP_BLOCK_BASE + 0x10)
++#define HS_OTP_PRGM_MODE			(HS_OTP_BLOCK_BASE + 0x14)
++#define HS_OTP_READ_DATA			(HS_OTP_BLOCK_BASE + 0x18)
++#define HS_OTP_FUNC_CMD				(HS_OTP_BLOCK_BASE + 0x20)
++#define HS_OTP_TST_CMD				(HS_OTP_BLOCK_BASE + 0x24)
++#define HS_OTP_CMD_GO				(HS_OTP_BLOCK_BASE + 0x28)
++#define HS_OTP_STATUS				(HS_OTP_BLOCK_BASE + 0x30)
++
+ /* MAC statistics registers */
+ #define STAT_RX_FCS_ERRORS			(0x1200)
+ #define STAT_RX_ALIGNMENT_ERRORS		(0x1204)
+@@ -540,10 +823,12 @@
+ 
+ #define LAN743X_MAX_RX_CHANNELS		(4)
+ #define LAN743X_MAX_TX_CHANNELS		(1)
++#define PCI11X1X_MAX_TX_CHANNELS	(4)
+ struct lan743x_adapter;
+ 
+ #define LAN743X_USED_RX_CHANNELS	(4)
+ #define LAN743X_USED_TX_CHANNELS	(1)
++#define PCI11X1X_USED_TX_CHANNELS	(4)
+ #define LAN743X_INT_MOD	(400)
+ 
+ #if (LAN743X_USED_RX_CHANNELS > LAN743X_MAX_RX_CHANNELS)
+@@ -552,12 +837,17 @@ struct lan743x_adapter;
+ #if (LAN743X_USED_TX_CHANNELS > LAN743X_MAX_TX_CHANNELS)
+ #error Invalid LAN743X_USED_TX_CHANNELS
+ #endif
++#if (PCI11X1X_USED_TX_CHANNELS > PCI11X1X_MAX_TX_CHANNELS)
++#error Invalid PCI11X1X_USED_TX_CHANNELS
++#endif
+ 
+ /* PCI */
+ /* SMSC acquired EFAR late 1990's, MCHP acquired SMSC 2012 */
+ #define PCI_VENDOR_ID_SMSC		PCI_VENDOR_ID_EFAR
+ #define PCI_DEVICE_ID_SMSC_LAN7430	(0x7430)
+ #define PCI_DEVICE_ID_SMSC_LAN7431	(0x7431)
++#define PCI_DEVICE_ID_SMSC_A011		(0xA011)
++#define PCI_DEVICE_ID_SMSC_A041		(0xA041)
+ 
+ #define PCI_CONFIG_LENGTH		(0x1000)
+ 
+@@ -606,17 +896,19 @@ struct lan743x_vector {
+ };
+ 
+ #define LAN743X_MAX_VECTOR_COUNT	(8)
++#define PCI11X1X_MAX_VECTOR_COUNT	(16)
+ 
+ struct lan743x_intr {
+ 	int			flags;
+ 
+ 	unsigned int		irq;
+ 
+-	struct lan743x_vector	vector_list[LAN743X_MAX_VECTOR_COUNT];
++	struct lan743x_vector	vector_list[PCI11X1X_MAX_VECTOR_COUNT];
+ 	int			number_of_vectors;
+ 	bool			using_vectors;
+ 
+-	int			software_isr_flag;
++	wait_queue_head_t	software_isr_wq;
++	bool			software_isr_flag;
+ };
+ 
+ #define LAN743X_MAX_FRAME_SIZE			(9 * 1024)
+@@ -666,8 +958,8 @@ struct lan743x_tx {
+ 	int		last_tail;
+ 
+ 	struct napi_struct napi;
+-
+-	struct sk_buff *overflow_skb;
++	u32 frame_count;
++	u32 rqd_descriptors;
+ };
+ 
+ void lan743x_tx_set_timestamping_mode(struct lan743x_tx *tx,
+@@ -698,15 +990,32 @@ struct lan743x_rx {
+ 	struct napi_struct napi;
+ 
+ 	u32		frame_count;
++
++	struct sk_buff *skb_head, *skb_tail;
++};
++
++/* SGMII Link Speed Duplex status */
++enum lan743x_sgmii_lsd {
++	POWER_DOWN = 0,
++	LINK_DOWN,
++	ANEG_BUSY,
++	LINK_10HD,
++	LINK_10FD,
++	LINK_100HD,
++	LINK_100FD,
++	LINK_1000_MASTER,
++	LINK_1000_SLAVE,
++	LINK_2500_MASTER,
++	LINK_2500_SLAVE
+ };
+ 
+ struct lan743x_adapter {
+ 	struct net_device       *netdev;
+ 	struct mii_bus		*mdiobus;
+-	phy_interface_t		phy_mode;
+ 	int                     msg_enable;
+ #ifdef CONFIG_PM
+ 	u32			wolopts;
++	u8			sopass[SOPASS_MAX];
+ #endif
+ 	struct pci_dev		*pdev;
+ 	struct lan743x_csr      csr;
+@@ -718,11 +1027,26 @@ struct lan743x_adapter {
+ 	u8			mac_address[ETH_ALEN];
+ 
+ 	struct lan743x_phy      phy;
+-	struct lan743x_tx       tx[LAN743X_MAX_TX_CHANNELS];
+-	struct lan743x_rx       rx[LAN743X_MAX_RX_CHANNELS];
++	struct lan743x_tx       tx[PCI11X1X_USED_TX_CHANNELS];
++	struct lan743x_rx       rx[LAN743X_USED_RX_CHANNELS];
++	bool			is_pci11x1x;
++	bool			is_sgmii_en;
++	/* protect ethernet syslock */
++	spinlock_t		eth_syslock_spinlock;
++	bool			eth_syslock_en;
++	u32			eth_syslock_acquire_cnt;
++	/* mutex lock structure */
++	struct mutex		sgmii_rw_lock;
++	/* SGMII Link Speed & Duplex status */
++	enum			lan743x_sgmii_lsd sgmii_lsd;
++	u8			max_tx_channels;
++	u8			used_tx_channels;
++	u8			max_vector_count;
+ 
+ #define LAN743X_ADAPTER_FLAG_OTP		BIT(0)
+ 	u32			flags;
++	u32			hw_cfg;
++	phy_interface_t		phy_interface;
+ };
+ 
+ #define LAN743X_COMPONENT_FLAG_RX(channel)  BIT(20 + (channel))
+@@ -792,7 +1116,7 @@ struct lan743x_tx_buffer_info {
+ 	unsigned int    buffer_length;
+ };
+ 
+-#define LAN743X_TX_RING_SIZE    (50)
++#define LAN743X_TX_RING_SIZE    (128)
+ 
+ /* OWN bit is set. ie, Descs are owned by RX DMAC */
+ #define RX_DESC_DATA0_OWN_                (0x00008000)
+@@ -804,6 +1128,9 @@ struct lan743x_tx_buffer_info {
+ 	(((data0) & RX_DESC_DATA0_FRAME_LENGTH_MASK_) >> 16)
+ #define RX_DESC_DATA0_EXT_                (0x00004000)
+ #define RX_DESC_DATA0_BUF_LENGTH_MASK_    (0x00003FFF)
++#define RX_DESC_DATA1_STATUS_ICE_         (0x00020000)
++#define RX_DESC_DATA1_STATUS_TCE_         (0x00010000)
++#define RX_DESC_DATA1_STATUS_ICSM_        (0x00000001)
+ #define RX_DESC_DATA2_TS_NS_MASK_         (0x3FFFFFFF)
+ 
+ #if ((NET_IP_ALIGN != 0) && (NET_IP_ALIGN != 2))
+@@ -828,13 +1155,17 @@ struct lan743x_rx_buffer_info {
+ 	unsigned int    buffer_length;
+ };
+ 
+-#define LAN743X_RX_RING_SIZE        (65)
++#define LAN743X_RX_RING_SIZE        (128)
+ 
+ #define RX_PROCESS_RESULT_NOTHING_TO_DO     (0)
+-#define RX_PROCESS_RESULT_PACKET_RECEIVED   (1)
+-#define RX_PROCESS_RESULT_PACKET_DROPPED    (2)
++#define RX_PROCESS_RESULT_BUFFER_RECEIVED   (1)
+ 
+ u32 lan743x_csr_read(struct lan743x_adapter *adapter, int offset);
+ void lan743x_csr_write(struct lan743x_adapter *adapter, int offset, u32 data);
++int lan743x_hs_syslock_acquire(struct lan743x_adapter *adapter, u16 timeout);
++void lan743x_hs_syslock_release(struct lan743x_adapter *adapter);
++void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
++				       bool tx_enable, bool rx_enable);
++int lan743x_sgmii_read(struct lan743x_adapter *adapter, u8 mmd, u16 addr);
+ 
+ #endif /* _LAN743X_H */
+diff --git a/drivers/net/ethernet/microchip/lan743x_ptp.c b/drivers/net/ethernet/microchip/lan743x_ptp.c
+index ab6d719d4..2715ba4c5 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ptp.c
++++ b/drivers/net/ethernet/microchip/lan743x_ptp.c
+@@ -25,6 +25,17 @@ static void lan743x_ptp_clock_set(struct lan743x_adapter *adapter,
+ 				  u32 seconds, u32 nano_seconds,
+ 				  u32 sub_nano_seconds);
+ 
++static int lan743x_get_channel(u32 ch_map)
++{
++	int idx;
++
++	for (idx = 0; idx < 32; idx++) {
++		if (ch_map & (0x1 << idx))
++			return idx;
++	}
++	return -EINVAL;
++}
++
+ int lan743x_gpio_init(struct lan743x_adapter *adapter)
+ {
+ 	struct lan743x_gpio *gpio = &adapter->gpio;
+@@ -179,6 +190,8 @@ static void lan743x_ptp_release_event_ch(struct lan743x_adapter *adapter,
+ static void lan743x_ptp_clock_get(struct lan743x_adapter *adapter,
+ 				  u32 *seconds, u32 *nano_seconds,
+ 				  u32 *sub_nano_seconds);
++static void lan743x_ptp_io_clock_get(struct lan743x_adapter *adapter,
++				     u32 *sec, u32 *nsec, u32 *sub_nsec);
+ static void lan743x_ptp_clock_step(struct lan743x_adapter *adapter,
+ 				   s64 time_step_ns);
+ 
+@@ -407,7 +420,10 @@ static int lan743x_ptpci_gettime64(struct ptp_clock_info *ptpci,
+ 	u32 nano_seconds = 0;
+ 	u32 seconds = 0;
+ 
+-	lan743x_ptp_clock_get(adapter, &seconds, &nano_seconds, NULL);
++	if (adapter->is_pci11x1x)
++		lan743x_ptp_io_clock_get(adapter, &seconds, &nano_seconds, NULL);
++	else
++		lan743x_ptp_clock_get(adapter, &seconds, &nano_seconds, NULL);
+ 	ts->tv_sec = seconds;
+ 	ts->tv_nsec = nano_seconds;
+ 
+@@ -491,9 +507,10 @@ static int lan743x_ptp_perout(struct lan743x_adapter *adapter, int on,
+ 	int perout_pin = 0;
+ 	unsigned int index = perout_request->index;
+ 	struct lan743x_ptp_perout *perout = &ptp->perout[index];
++	int ret = 0;
+ 
+ 	/* Reject requests with unsupported flags */
+-	if (perout_request->flags)
++	if (perout_request->flags & ~PTP_PEROUT_DUTY_CYCLE)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (on) {
+@@ -518,6 +535,7 @@ static int lan743x_ptp_perout(struct lan743x_adapter *adapter, int on,
+ 		netif_warn(adapter, drv, adapter->netdev,
+ 			   "Failed to reserve event channel %d for PEROUT\n",
+ 			   index);
++		ret = -EBUSY;
+ 		goto failed;
+ 	}
+ 
+@@ -529,6 +547,7 @@ static int lan743x_ptp_perout(struct lan743x_adapter *adapter, int on,
+ 		netif_warn(adapter, drv, adapter->netdev,
+ 			   "Failed to reserve gpio %d for PEROUT\n",
+ 			   perout_pin);
++		ret = -EBUSY;
+ 		goto failed;
+ 	}
+ 
+@@ -540,27 +559,92 @@ static int lan743x_ptp_perout(struct lan743x_adapter *adapter, int on,
+ 	period_sec += perout_request->period.nsec / 1000000000;
+ 	period_nsec = perout_request->period.nsec % 1000000000;
+ 
+-	if (period_sec == 0) {
+-		if (period_nsec >= 400000000) {
++	if (perout_request->flags & PTP_PEROUT_DUTY_CYCLE) {
++		struct timespec64 ts_on, ts_period;
++		s64 wf_high, period64, half;
++		s32 reminder;
++
++		ts_on.tv_sec = perout_request->on.sec;
++		ts_on.tv_nsec = perout_request->on.nsec;
++		wf_high = timespec64_to_ns(&ts_on);
++		ts_period.tv_sec = perout_request->period.sec;
++		ts_period.tv_nsec = perout_request->period.nsec;
++		period64 = timespec64_to_ns(&ts_period);
++
++		if (period64 < 200) {
++			netif_warn(adapter, drv, adapter->netdev,
++				   "perout period too small, minimum is 200nS\n");
++			ret = -EOPNOTSUPP;
++			goto failed;
++		}
++		if (wf_high >= period64) {
++			netif_warn(adapter, drv, adapter->netdev,
++				   "pulse width must be smaller than period\n");
++			ret = -EINVAL;
++			goto failed;
++		}
++		/* Check if we can do 50% toggle on an even value of period.
++		 * If the period number is odd, then check if the requested
++		 * pulse width is the same as one of pre-defined width values.
++		 * Otherwise, return failure.
++		 */
++		half = div_s64_rem(period64, 2, &reminder);
++		if (!reminder) {
++			if (half == wf_high) {
++				/* It's 50% match. Use the toggle option */
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_TOGGLE_;
++				/* In this case, devide period value by 2 */
++				ts_period = ns_to_timespec64(div_s64(period64, 2));
++				period_sec = ts_period.tv_sec;
++				period_nsec = ts_period.tv_nsec;
++
++				goto program;
++			}
++		}
++		/* if we can't do toggle, then the width option needs to be the exact match */
++		if (wf_high == 200000000) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
+-		} else if (period_nsec >= 20000000) {
++		} else if (wf_high == 10000000) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_10MS_;
+-		} else if (period_nsec >= 2000000) {
++		} else if (wf_high == 1000000) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_1MS_;
+-		} else if (period_nsec >= 200000) {
++		} else if (wf_high == 100000) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_100US_;
+-		} else if (period_nsec >= 20000) {
++		} else if (wf_high == 10000) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_10US_;
+-		} else if (period_nsec >= 200) {
++		} else if (wf_high == 100) {
+ 			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_100NS_;
+ 		} else {
+ 			netif_warn(adapter, drv, adapter->netdev,
+-				   "perout period too small, minimum is 200nS\n");
++					"duty cycle specified is not supported\n");
++			ret = -EOPNOTSUPP;
+ 			goto failed;
+ 		}
+ 	} else {
+-		pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
++		if (period_sec == 0) {
++			if (period_nsec >= 400000000) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
++			} else if (period_nsec >= 20000000) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_10MS_;
++			} else if (period_nsec >= 2000000) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_1MS_;
++			} else if (period_nsec >= 200000) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_100US_;
++			} else if (period_nsec >= 20000) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_10US_;
++			} else if (period_nsec >= 200) {
++				pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_100NS_;
++			} else {
++				netif_warn(adapter, drv, adapter->netdev,
++					   "perout period too small, minimum is 200nS\n");
++				ret = -EOPNOTSUPP;
++				goto failed;
++			}
++		} else {
++			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
++		}
+ 	}
++program:
+ 
+ 	/* turn off by setting target far in future */
+ 	lan743x_csr_write(adapter,
+@@ -599,9 +683,320 @@ static int lan743x_ptp_perout(struct lan743x_adapter *adapter, int on,
+ 
+ failed:
+ 	lan743x_ptp_perout_off(adapter, index);
++	return ret;
++}
++
++static void lan743x_ptp_io_perout_off(struct lan743x_adapter *adapter, u32 index)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	int perout_pin;
++	int event_ch;
++	u32 gen_cfg;
++	int val;
++
++	event_ch = ptp->ptp_io_perout[index];
++	if (event_ch >= 0) {
++		/* set target to far in the future, effectively disabling it */
++		lan743x_csr_write(adapter,
++				  PTP_CLOCK_TARGET_SEC_X(event_ch),
++				  0xFFFF0000);
++		lan743x_csr_write(adapter,
++				  PTP_CLOCK_TARGET_NS_X(event_ch),
++				  0);
++		gen_cfg = lan743x_csr_read(adapter, HS_PTP_GENERAL_CONFIG);
++		gen_cfg &= ~(HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_X_MASK_
++			     (event_ch));
++		gen_cfg &= ~(HS_PTP_GENERAL_CONFIG_EVENT_POL_X_(event_ch));
++		gen_cfg |= HS_PTP_GENERAL_CONFIG_RELOAD_ADD_X_(event_ch);
++		lan743x_csr_write(adapter, HS_PTP_GENERAL_CONFIG, gen_cfg);
++		if (event_ch)
++			lan743x_csr_write(adapter, PTP_INT_STS,
++					  PTP_INT_TIMER_INT_B_);
++		else
++			lan743x_csr_write(adapter, PTP_INT_STS,
++					  PTP_INT_TIMER_INT_A_);
++		lan743x_ptp_release_event_ch(adapter, event_ch);
++		ptp->ptp_io_perout[index] = -1;
++	}
++
++	perout_pin = ptp_find_pin(ptp->ptp_clock, PTP_PF_PEROUT, index);
++
++	/* Deselect Event output */
++	val = lan743x_csr_read(adapter, PTP_IO_EVENT_OUTPUT_CFG);
++
++	/* Disables the output of Local Time Target compare events */
++	val &= ~PTP_IO_EVENT_OUTPUT_CFG_EN_(perout_pin);
++	lan743x_csr_write(adapter, PTP_IO_EVENT_OUTPUT_CFG, val);
++
++	/* Configured as an opendrain driver*/
++	val = lan743x_csr_read(adapter, PTP_IO_PIN_CFG);
++	val &= ~PTP_IO_PIN_CFG_OBUF_TYPE_(perout_pin);
++	lan743x_csr_write(adapter, PTP_IO_PIN_CFG, val);
++	/* Dummy read to make sure write operation success */
++	val = lan743x_csr_read(adapter, PTP_IO_PIN_CFG);
++}
++
++static int lan743x_ptp_io_perout(struct lan743x_adapter *adapter, int on,
++				 struct ptp_perout_request *perout_request)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	u32 period_sec, period_nsec;
++	u32 start_sec, start_nsec;
++	u32 pulse_sec, pulse_nsec;
++	int pulse_width;
++	int perout_pin;
++	int event_ch;
++	u32 gen_cfg;
++	u32 index;
++	int val;
++
++	index = perout_request->index;
++	event_ch = ptp->ptp_io_perout[index];
++	if (on) {
++		perout_pin = ptp_find_pin(ptp->ptp_clock, PTP_PF_PEROUT, index);
++		if (perout_pin < 0)
++			return -EBUSY;
++	} else {
++		lan743x_ptp_io_perout_off(adapter, index);
++		return 0;
++	}
++
++	if (event_ch >= LAN743X_PTP_N_EVENT_CHAN) {
++		/* already on, turn off first */
++		lan743x_ptp_io_perout_off(adapter, index);
++	}
++
++	event_ch = lan743x_ptp_reserve_event_ch(adapter, index);
++	if (event_ch < 0) {
++		netif_warn(adapter, drv, adapter->netdev,
++			   "Failed to reserve event channel %d for PEROUT\n",
++			   index);
++		goto failed;
++	}
++	ptp->ptp_io_perout[index] = event_ch;
++
++	if (perout_request->flags & PTP_PEROUT_DUTY_CYCLE) {
++		pulse_sec = perout_request->on.sec;
++		pulse_sec += perout_request->on.nsec / 1000000000;
++		pulse_nsec = perout_request->on.nsec % 1000000000;
++	} else {
++		pulse_sec = perout_request->period.sec;
++		pulse_sec += perout_request->period.nsec / 1000000000;
++		pulse_nsec = perout_request->period.nsec % 1000000000;
++	}
++
++	if (pulse_sec == 0) {
++		if (pulse_nsec >= 400000000) {
++			pulse_width = PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
++		} else if (pulse_nsec >= 200000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100MS_;
++		} else if (pulse_nsec >= 100000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_50MS_;
++		} else if (pulse_nsec >= 20000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_10MS_;
++		} else if (pulse_nsec >= 10000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_5MS_;
++		} else if (pulse_nsec >= 2000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_1MS_;
++		} else if (pulse_nsec >= 1000000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_500US_;
++		} else if (pulse_nsec >= 200000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100US_;
++		} else if (pulse_nsec >= 100000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_50US_;
++		} else if (pulse_nsec >= 20000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_10US_;
++		} else if (pulse_nsec >= 10000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_5US_;
++		} else if (pulse_nsec >= 2000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_1US_;
++		} else if (pulse_nsec >= 1000) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_500NS_;
++		} else if (pulse_nsec >= 200) {
++			pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_100NS_;
++		} else {
++			netif_warn(adapter, drv, adapter->netdev,
++				   "perout period too small, min is 200nS\n");
++			goto failed;
++		}
++	} else {
++		pulse_width = HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_200MS_;
++	}
++
++	/* turn off by setting target far in future */
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_SEC_X(event_ch),
++			  0xFFFF0000);
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_NS_X(event_ch), 0);
++
++	/* Configure to pulse every period */
++	gen_cfg = lan743x_csr_read(adapter, HS_PTP_GENERAL_CONFIG);
++	gen_cfg &= ~(HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_X_MASK_(event_ch));
++	gen_cfg |= HS_PTP_GENERAL_CONFIG_CLOCK_EVENT_X_SET_
++		(event_ch, pulse_width);
++	gen_cfg |= HS_PTP_GENERAL_CONFIG_EVENT_POL_X_(event_ch);
++	gen_cfg &= ~(HS_PTP_GENERAL_CONFIG_RELOAD_ADD_X_(event_ch));
++	lan743x_csr_write(adapter, HS_PTP_GENERAL_CONFIG, gen_cfg);
++
++	/* set the reload to one toggle cycle */
++	period_sec = perout_request->period.sec;
++	period_sec += perout_request->period.nsec / 1000000000;
++	period_nsec = perout_request->period.nsec % 1000000000;
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_RELOAD_SEC_X(event_ch),
++			  period_sec);
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_RELOAD_NS_X(event_ch),
++			  period_nsec);
++
++	start_sec = perout_request->start.sec;
++	start_sec += perout_request->start.nsec / 1000000000;
++	start_nsec = perout_request->start.nsec % 1000000000;
++
++	/* set the start time */
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_SEC_X(event_ch),
++			  start_sec);
++	lan743x_csr_write(adapter,
++			  PTP_CLOCK_TARGET_NS_X(event_ch),
++			  start_nsec);
++
++	/* Enable LTC Target Read */
++	val = lan743x_csr_read(adapter, PTP_CMD_CTL);
++	val |= PTP_CMD_CTL_PTP_LTC_TARGET_READ_;
++	lan743x_csr_write(adapter, PTP_CMD_CTL, val);
++
++	/* Configure as an push/pull driver */
++	val = lan743x_csr_read(adapter, PTP_IO_PIN_CFG);
++	val |= PTP_IO_PIN_CFG_OBUF_TYPE_(perout_pin);
++	lan743x_csr_write(adapter, PTP_IO_PIN_CFG, val);
++
++	/* Select Event output */
++	val = lan743x_csr_read(adapter, PTP_IO_EVENT_OUTPUT_CFG);
++	if (event_ch)
++		/* Channel B as the output */
++		val |= PTP_IO_EVENT_OUTPUT_CFG_SEL_(perout_pin);
++	else
++		/* Channel A as the output */
++		val &= ~PTP_IO_EVENT_OUTPUT_CFG_SEL_(perout_pin);
++
++	/* Enables the output of Local Time Target compare events */
++	val |= PTP_IO_EVENT_OUTPUT_CFG_EN_(perout_pin);
++	lan743x_csr_write(adapter, PTP_IO_EVENT_OUTPUT_CFG, val);
++
++	return 0;
++
++failed:
++	lan743x_ptp_io_perout_off(adapter, index);
+ 	return -ENODEV;
+ }
+ 
++static void lan743x_ptp_io_extts_off(struct lan743x_adapter *adapter,
++				     u32 index)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	struct lan743x_extts *extts;
++	int val;
++
++	extts = &ptp->extts[index];
++	/* PTP Interrupt Enable Clear Register */
++	if (extts->flags & PTP_FALLING_EDGE)
++		val = PTP_INT_EN_FE_EN_CLR_(index);
++	else
++		val = PTP_INT_EN_RE_EN_CLR_(index);
++	lan743x_csr_write(adapter, PTP_INT_EN_CLR, val);
++
++	/* Disables PTP-IO edge lock */
++	val = lan743x_csr_read(adapter, PTP_IO_CAP_CONFIG);
++	if (extts->flags & PTP_FALLING_EDGE) {
++		val &= ~PTP_IO_CAP_CONFIG_LOCK_FE_(index);
++		val &= ~PTP_IO_CAP_CONFIG_FE_CAP_EN_(index);
++	} else {
++		val &= ~PTP_IO_CAP_CONFIG_LOCK_RE_(index);
++		val &= ~PTP_IO_CAP_CONFIG_RE_CAP_EN_(index);
++	}
++	lan743x_csr_write(adapter, PTP_IO_CAP_CONFIG, val);
++
++	/* PTP-IO De-select register */
++	val = lan743x_csr_read(adapter, PTP_IO_SEL);
++	val &= ~PTP_IO_SEL_MASK_;
++	lan743x_csr_write(adapter, PTP_IO_SEL, val);
++
++	/* Clear timestamp */
++	memset(&extts->ts, 0, sizeof(struct timespec64));
++	extts->flags = 0;
++}
++
++static int lan743x_ptp_io_event_cap_en(struct lan743x_adapter *adapter,
++				       u32 flags, u32 channel)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	int val;
++
++	if ((flags & PTP_EXTTS_EDGES) ==  PTP_EXTTS_EDGES)
++		return -EOPNOTSUPP;
++	mutex_lock(&ptp->command_lock);
++	/* PTP-IO Event Capture Enable */
++	val = lan743x_csr_read(adapter, PTP_IO_CAP_CONFIG);
++	if (flags & PTP_FALLING_EDGE) {
++		val &= ~PTP_IO_CAP_CONFIG_LOCK_RE_(channel);
++		val &= ~PTP_IO_CAP_CONFIG_RE_CAP_EN_(channel);
++		val |= PTP_IO_CAP_CONFIG_LOCK_FE_(channel);
++		val |= PTP_IO_CAP_CONFIG_FE_CAP_EN_(channel);
++	} else {
++		/* Rising eventing as Default */
++		val &= ~PTP_IO_CAP_CONFIG_LOCK_FE_(channel);
++		val &= ~PTP_IO_CAP_CONFIG_FE_CAP_EN_(channel);
++		val |= PTP_IO_CAP_CONFIG_LOCK_RE_(channel);
++		val |= PTP_IO_CAP_CONFIG_RE_CAP_EN_(channel);
++	}
++	lan743x_csr_write(adapter, PTP_IO_CAP_CONFIG, val);
++
++	/* PTP-IO Select */
++	val = lan743x_csr_read(adapter, PTP_IO_SEL);
++	val &= ~PTP_IO_SEL_MASK_;
++	val |= channel << PTP_IO_SEL_SHIFT_;
++	lan743x_csr_write(adapter, PTP_IO_SEL, val);
++
++	/* PTP Interrupt Enable Register */
++	if (flags & PTP_FALLING_EDGE)
++		val = PTP_INT_EN_FE_EN_SET_(channel);
++	else
++		val = PTP_INT_EN_RE_EN_SET_(channel);
++	lan743x_csr_write(adapter, PTP_INT_EN_SET, val);
++
++	mutex_unlock(&ptp->command_lock);
++
++	return 0;
++}
++
++static int lan743x_ptp_io_extts(struct lan743x_adapter *adapter, int on,
++				struct ptp_extts_request *extts_request)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	u32 flags = extts_request->flags;
++	u32 index = extts_request->index;
++	struct lan743x_extts *extts;
++	int extts_pin;
++	int ret = 0;
++
++	extts = &ptp->extts[index];
++
++	if (on) {
++		extts_pin = ptp_find_pin(ptp->ptp_clock, PTP_PF_EXTTS, index);
++		if (extts_pin < 0)
++			return -EBUSY;
++		ret = lan743x_ptp_io_event_cap_en(adapter, flags, index);
++		if (!ret)
++			extts->flags = flags;
++	} else {
++		lan743x_ptp_io_extts_off(adapter, index);
++	}
++
++	return ret;
++}
++
+ static int lan743x_ptpci_enable(struct ptp_clock_info *ptpci,
+ 				struct ptp_clock_request *request, int on)
+ {
+@@ -613,12 +1008,20 @@ static int lan743x_ptpci_enable(struct ptp_clock_info *ptpci,
+ 	if (request) {
+ 		switch (request->type) {
+ 		case PTP_CLK_REQ_EXTTS:
++			if (request->extts.index < ptpci->n_ext_ts)
++				return lan743x_ptp_io_extts(adapter, on,
++						&request->extts);
+ 			return -EINVAL;
+ 		case PTP_CLK_REQ_PEROUT:
+-			if (request->perout.index < ptpci->n_per_out)
+-				return lan743x_ptp_perout(adapter, on,
+-							  &request->perout);
+-			return -EINVAL;
++			if (request->perout.index < ptpci->n_per_out) {
++				if (adapter->is_pci11x1x)
++					return lan743x_ptp_io_perout(adapter, on,
++						&request->perout);
++				else
++					return lan743x_ptp_perout(adapter, on,
++							&request->perout);
++			}
++		return -EINVAL;
+ 		case PTP_CLK_REQ_PPS:
+ 			return -EINVAL;
+ 		default:
+@@ -638,6 +1041,10 @@ static int lan743x_ptpci_verify_pin_config(struct ptp_clock_info *ptp,
+ 					   enum ptp_pin_function func,
+ 					   unsigned int chan)
+ {
++	struct lan743x_ptp *lan_ptp =
++		container_of(ptp, struct lan743x_ptp, ptp_clock_info);
++	struct lan743x_adapter *adapter =
++		container_of(lan_ptp, struct lan743x_adapter, ptp);
+ 	int result = 0;
+ 
+ 	/* Confirm the requested function is supported. Parameter
+@@ -648,6 +1055,9 @@ static int lan743x_ptpci_verify_pin_config(struct ptp_clock_info *ptp,
+ 	case PTP_PF_PEROUT:
+ 		break;
+ 	case PTP_PF_EXTTS:
++		if (!adapter->is_pci11x1x)
++			result = -1;
++		break;
+ 	case PTP_PF_PHYSYNC:
+ 	default:
+ 		result = -1;
+@@ -656,6 +1066,33 @@ static int lan743x_ptpci_verify_pin_config(struct ptp_clock_info *ptp,
+ 	return result;
+ }
+ 
++static void lan743x_ptp_io_event_clock_get(struct lan743x_adapter *adapter,
++					   bool fe, u8 channel,
++					   struct timespec64 *ts)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++	struct lan743x_extts *extts;
++	u32 sec, nsec;
++
++	mutex_lock(&ptp->command_lock);
++	if (fe) {
++		sec = lan743x_csr_read(adapter, PTP_IO_FE_LTC_SEC_CAP_X);
++		nsec = lan743x_csr_read(adapter, PTP_IO_FE_LTC_NS_CAP_X);
++	} else {
++		sec = lan743x_csr_read(adapter, PTP_IO_RE_LTC_SEC_CAP_X);
++		nsec = lan743x_csr_read(adapter, PTP_IO_RE_LTC_NS_CAP_X);
++	}
++
++	mutex_unlock(&ptp->command_lock);
++
++	/* Update Local timestamp */
++	extts = &ptp->extts[channel];
++	extts->ts.tv_sec = sec;
++	extts->ts.tv_nsec = nsec;
++	ts->tv_sec = sec;
++	ts->tv_nsec = nsec;
++}
++
+ static long lan743x_ptpci_do_aux_work(struct ptp_clock_info *ptpci)
+ {
+ 	struct lan743x_ptp *ptp =
+@@ -664,41 +1101,116 @@ static long lan743x_ptpci_do_aux_work(struct ptp_clock_info *ptpci)
+ 		container_of(ptp, struct lan743x_adapter, ptp);
+ 	u32 cap_info, cause, header, nsec, seconds;
+ 	bool new_timestamp_available = false;
++	struct ptp_clock_event ptp_event;
++	struct timespec64 ts;
++	int ptp_int_sts;
+ 	int count = 0;
++	int channel;
++	s64 ns;
+ 
++	ptp_int_sts = lan743x_csr_read(adapter, PTP_INT_STS);
+ 	while ((count < 100) &&
+-	       (lan743x_csr_read(adapter, PTP_INT_STS) & PTP_INT_BIT_TX_TS_)) {
++		(lan743x_csr_read(adapter, PTP_INT_STS) & PTP_INT_BIT_TX_TS_)) {
+ 		count++;
+-		cap_info = lan743x_csr_read(adapter, PTP_CAP_INFO);
+-
+-		if (PTP_CAP_INFO_TX_TS_CNT_GET_(cap_info) > 0) {
+-			seconds = lan743x_csr_read(adapter,
+-						   PTP_TX_EGRESS_SEC);
+-			nsec = lan743x_csr_read(adapter, PTP_TX_EGRESS_NS);
+-			cause = (nsec &
+-				 PTP_TX_EGRESS_NS_CAPTURE_CAUSE_MASK_);
+-			header = lan743x_csr_read(adapter,
+-						  PTP_TX_MSG_HEADER);
+-
+-			if (cause == PTP_TX_EGRESS_NS_CAPTURE_CAUSE_SW_) {
+-				nsec &= PTP_TX_EGRESS_NS_TS_NS_MASK_;
+-				lan743x_ptp_tx_ts_enqueue_ts(adapter,
+-							     seconds, nsec,
+-							     header);
+-				new_timestamp_available = true;
+-			} else if (cause ==
+-				PTP_TX_EGRESS_NS_CAPTURE_CAUSE_AUTO_) {
+-				netif_err(adapter, drv, adapter->netdev,
+-					  "Auto capture cause not supported\n");
++
++		if (ptp_int_sts & PTP_INT_BIT_TX_TS_) {
++			cap_info = lan743x_csr_read(adapter, PTP_CAP_INFO);
++
++			if (PTP_CAP_INFO_TX_TS_CNT_GET_(cap_info) > 0) {
++				seconds = lan743x_csr_read(adapter,
++							   PTP_TX_EGRESS_SEC);
++				nsec = lan743x_csr_read(adapter, PTP_TX_EGRESS_NS);
++				cause = (nsec &
++						PTP_TX_EGRESS_NS_CAPTURE_CAUSE_MASK_);
++				header = lan743x_csr_read(adapter, PTP_TX_MSG_HEADER);
++
++				if (cause == PTP_TX_EGRESS_NS_CAPTURE_CAUSE_SW_) {
++					nsec &= PTP_TX_EGRESS_NS_TS_NS_MASK_;
++					lan743x_ptp_tx_ts_enqueue_ts(adapter,
++								     seconds, nsec,
++								     header);
++					new_timestamp_available = true;
++
++				} else if (cause ==
++						PTP_TX_EGRESS_NS_CAPTURE_CAUSE_AUTO_) {
++					netif_err(adapter, drv, adapter->netdev,
++						  "Auto capture cause not supported\n");
++				} else {
++					netif_warn(adapter, drv, adapter->netdev,
++						   "unknown tx timestamp capture cause\n");
++				}
+ 			} else {
+ 				netif_warn(adapter, drv, adapter->netdev,
+-					   "unknown tx timestamp capture cause\n");
++					   "TX TS INT but no TX TS CNT\n");
+ 			}
+-		} else {
+-			netif_warn(adapter, drv, adapter->netdev,
+-				   "TX TS INT but no TX TS CNT\n");
++			lan743x_csr_write(adapter, PTP_INT_STS, PTP_INT_BIT_TX_TS_);
++		}
++
++		if (ptp_int_sts & PTP_INT_IO_FE_MASK_) {
++			do {
++				channel = lan743x_get_channel((ptp_int_sts &
++						PTP_INT_IO_FE_MASK_) >>
++						PTP_INT_IO_FE_SHIFT_);
++				if (channel >= 0 &&
++				    channel < PCI11X1X_PTP_IO_MAX_CHANNELS) {
++					lan743x_ptp_io_event_clock_get(adapter,
++								       true,
++								       channel,
++								       &ts);
++					/* PTP Falling Event post */
++					ns = timespec64_to_ns(&ts);
++					ptp_event.timestamp = ns;
++					ptp_event.index = channel;
++					ptp_event.type = PTP_CLOCK_EXTTS;
++					ptp_clock_event(ptp->ptp_clock,
++							&ptp_event);
++					lan743x_csr_write(adapter, PTP_INT_STS,
++							  PTP_INT_IO_FE_SET_
++							  (channel));
++					ptp_int_sts &= ~(1 <<
++							(PTP_INT_IO_FE_SHIFT_ +
++							 channel));
++				} else {
++					/* Clear falling event interrupts */
++					lan743x_csr_write(adapter, PTP_INT_STS,
++							  PTP_INT_IO_FE_MASK_);
++					ptp_int_sts &= ~PTP_INT_IO_FE_MASK_;
++				}
++			} while (ptp_int_sts & PTP_INT_IO_FE_MASK_);
+ 		}
+-		lan743x_csr_write(adapter, PTP_INT_STS, PTP_INT_BIT_TX_TS_);
++
++		if (ptp_int_sts & PTP_INT_IO_RE_MASK_) {
++			do {
++				channel = lan743x_get_channel((ptp_int_sts &
++						PTP_INT_IO_RE_MASK_) >>
++						PTP_INT_IO_RE_SHIFT_);
++				if (channel >= 0 &&
++				    channel < PCI11X1X_PTP_IO_MAX_CHANNELS) {
++					lan743x_ptp_io_event_clock_get(adapter, false,
++								       channel, &ts);
++					/* PTP Rising Event post */
++					ns = timespec64_to_ns(&ts);
++					ptp_event.timestamp = ns;
++					ptp_event.index = channel;
++					ptp_event.type = PTP_CLOCK_EXTTS;
++					ptp_clock_event(ptp->ptp_clock,
++							&ptp_event);
++					lan743x_csr_write(adapter, PTP_INT_STS,
++							  PTP_INT_IO_RE_SET_
++							(channel));
++					ptp_int_sts &= ~(1 <<
++							(PTP_INT_IO_RE_SHIFT_ +
++							 channel));
++				} else {
++					/* Clear Rising event interrupt */
++					lan743x_csr_write(adapter, PTP_INT_STS,
++							  PTP_INT_IO_RE_MASK_);
++					ptp_int_sts &= ~PTP_INT_IO_RE_MASK_;
++				}
++			} while (ptp_int_sts & PTP_INT_IO_RE_MASK_);
++		}
++
++		ptp_int_sts = lan743x_csr_read(adapter, PTP_INT_STS);
+ 	}
+ 
+ 	if (new_timestamp_available)
+@@ -733,6 +1245,28 @@ static void lan743x_ptp_clock_get(struct lan743x_adapter *adapter,
+ 	mutex_unlock(&ptp->command_lock);
+ }
+ 
++static void lan743x_ptp_io_clock_get(struct lan743x_adapter *adapter,
++				     u32 *sec, u32 *nsec, u32 *sub_nsec)
++{
++	struct lan743x_ptp *ptp = &adapter->ptp;
++
++	mutex_lock(&ptp->command_lock);
++	lan743x_csr_write(adapter, PTP_CMD_CTL, PTP_CMD_CTL_PTP_CLOCK_READ_);
++	lan743x_ptp_wait_till_cmd_done(adapter, PTP_CMD_CTL_PTP_CLOCK_READ_);
++
++	if (sec)
++		(*sec) = lan743x_csr_read(adapter, PTP_LTC_RD_SEC_LO);
++
++	if (nsec)
++		(*nsec) = lan743x_csr_read(adapter, PTP_LTC_RD_NS);
++
++	if (sub_nsec)
++		(*sub_nsec) =
++			lan743x_csr_read(adapter, PTP_LTC_RD_SUBNS);
++
++	mutex_unlock(&ptp->command_lock);
++}
++
+ static void lan743x_ptp_clock_step(struct lan743x_adapter *adapter,
+ 				   s64 time_step_ns)
+ {
+@@ -746,8 +1280,12 @@ static void lan743x_ptp_clock_step(struct lan743x_adapter *adapter,
+ 
+ 	if (time_step_ns >  15000000000LL) {
+ 		/* convert to clock set */
+-		lan743x_ptp_clock_get(adapter, &unsigned_seconds,
+-				      &nano_seconds, NULL);
++		if (adapter->is_pci11x1x)
++			lan743x_ptp_io_clock_get(adapter, &unsigned_seconds,
++						 &nano_seconds, NULL);
++		else
++			lan743x_ptp_clock_get(adapter, &unsigned_seconds,
++					      &nano_seconds, NULL);
+ 		unsigned_seconds += div_u64_rem(time_step_ns, 1000000000LL,
+ 						&remainder);
+ 		nano_seconds += remainder;
+@@ -762,8 +1300,13 @@ static void lan743x_ptp_clock_step(struct lan743x_adapter *adapter,
+ 		/* convert to clock set */
+ 		time_step_ns = -time_step_ns;
+ 
+-		lan743x_ptp_clock_get(adapter, &unsigned_seconds,
+-				      &nano_seconds, NULL);
++		if (adapter->is_pci11x1x) {
++			lan743x_ptp_io_clock_get(adapter, &unsigned_seconds,
++						 &nano_seconds, NULL);
++		} else {
++			lan743x_ptp_clock_get(adapter, &unsigned_seconds,
++					      &nano_seconds, NULL);
++		}
+ 		unsigned_seconds -= div_u64_rem(time_step_ns, 1000000000LL,
+ 						&remainder);
+ 		nano_seconds_step = remainder;
+@@ -992,6 +1535,8 @@ int lan743x_ptp_open(struct lan743x_adapter *adapter)
+ 		n_pins = LAN7430_N_GPIO;
+ 		break;
+ 	case ID_REV_ID_LAN7431_:
++	case ID_REV_ID_A011_:
++	case ID_REV_ID_A041_:
+ 		n_pins = LAN7431_N_GPIO;
+ 		break;
+ 	default:
+@@ -1019,10 +1564,10 @@ int lan743x_ptp_open(struct lan743x_adapter *adapter)
+ 		 adapter->netdev->dev_addr);
+ 	ptp->ptp_clock_info.max_adj = LAN743X_PTP_MAX_FREQ_ADJ_IN_PPB;
+ 	ptp->ptp_clock_info.n_alarm = 0;
+-	ptp->ptp_clock_info.n_ext_ts = 0;
++	ptp->ptp_clock_info.n_ext_ts = LAN743X_PTP_N_EXTTS;
+ 	ptp->ptp_clock_info.n_per_out = LAN743X_PTP_N_EVENT_CHAN;
+ 	ptp->ptp_clock_info.n_pins = n_pins;
+-	ptp->ptp_clock_info.pps = 0;
++	ptp->ptp_clock_info.pps = LAN743X_PTP_N_PPS;
+ 	ptp->ptp_clock_info.pin_config = ptp->pin_config;
+ 	ptp->ptp_clock_info.adjfine = lan743x_ptpci_adjfine;
+ 	ptp->ptp_clock_info.adjfreq = lan743x_ptpci_adjfreq;
+@@ -1123,6 +1668,9 @@ static void lan743x_ptp_enable(struct lan743x_adapter *adapter)
+ 
+ 	mutex_lock(&ptp->command_lock);
+ 
++	lan743x_csr_write(adapter, PTP_RX_TS_CFG, PTP_RX_TS_CFG_MSG_EN_ALL_ |
++			  lan743x_csr_read(adapter, PTP_RX_TS_CFG));
++
+ 	if (lan743x_ptp_is_enabled(adapter)) {
+ 		netif_warn(adapter, drv, adapter->netdev,
+ 			   "PTP already enabled\n");
+@@ -1238,27 +1786,27 @@ int lan743x_ptp_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ 
+ 	if (config.flags) {
+ 		netif_warn(adapter, drv, adapter->netdev,
+-			   "ignoring hwtstamp_config.flags == 0x%08X, expected 0\n",
+-			   config.flags);
++			"ignoring hwtstamp_config.flags == 0x%08X, expected 0\n",
++			config.flags);
+ 	}
+ 
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+-		for (index = 0; index < LAN743X_MAX_TX_CHANNELS;
++		for (index = 0; index < adapter->used_tx_channels;
+ 			index++)
+ 			lan743x_tx_set_timestamping_mode(&adapter->tx[index],
+ 							 false, false);
+ 		lan743x_ptp_set_sync_ts_insert(adapter, false);
+ 		break;
+ 	case HWTSTAMP_TX_ON:
+-		for (index = 0; index < LAN743X_MAX_TX_CHANNELS;
++		for (index = 0; index < adapter->used_tx_channels;
+ 			index++)
+ 			lan743x_tx_set_timestamping_mode(&adapter->tx[index],
+ 							 true, false);
+ 		lan743x_ptp_set_sync_ts_insert(adapter, false);
+ 		break;
+ 	case HWTSTAMP_TX_ONESTEP_SYNC:
+-		for (index = 0; index < LAN743X_MAX_TX_CHANNELS;
++		for (index = 0; index < adapter->used_tx_channels;
+ 			index++)
+ 			lan743x_tx_set_timestamping_mode(&adapter->tx[index],
+ 							 true, true);
+diff --git a/drivers/net/ethernet/microchip/lan743x_ptp.h b/drivers/net/ethernet/microchip/lan743x_ptp.h
+index 7663bf5d2..e26d4eff7 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ptp.h
++++ b/drivers/net/ethernet/microchip/lan743x_ptp.h
+@@ -18,6 +18,9 @@
+  */
+ #define LAN743X_PTP_N_EVENT_CHAN	2
+ #define LAN743X_PTP_N_PEROUT		LAN743X_PTP_N_EVENT_CHAN
++#define LAN743X_PTP_N_EXTTS		4
++#define LAN743X_PTP_N_PPS		0
++#define PCI11X1X_PTP_IO_MAX_CHANNELS	8
+ 
+ struct lan743x_adapter;
+ 
+@@ -60,6 +63,11 @@ struct lan743x_ptp_perout {
+ 	int  gpio_pin;	/* GPIO pin where output appears */
+ };
+ 
++struct lan743x_extts {
++	int flags;
++	struct timespec64 ts;
++};
++
+ struct lan743x_ptp {
+ 	int flags;
+ 
+@@ -72,6 +80,8 @@ struct lan743x_ptp {
+ 
+ 	unsigned long used_event_ch;
+ 	struct lan743x_ptp_perout perout[LAN743X_PTP_N_PEROUT];
++	int ptp_io_perout[LAN743X_PTP_N_PEROUT]; /* PTP event channel (0=channel A, 1=channel B) */
++	struct lan743x_extts extts[LAN743X_PTP_N_EXTTS];
+ 
+ 	bool leds_multiplexed;
+ 	bool led_enabled[LAN7430_N_LED];

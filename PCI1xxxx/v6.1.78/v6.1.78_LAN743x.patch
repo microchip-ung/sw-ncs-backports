@@ -1,0 +1,611 @@
+diff --git a/drivers/net/ethernet/microchip/lan743x_ethtool.c b/drivers/net/ethernet/microchip/lan743x_ethtool.c
+index c739d60ee..c5d4e1455 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ethtool.c
++++ b/drivers/net/ethernet/microchip/lan743x_ethtool.c
+@@ -1047,7 +1047,8 @@ static int lan743x_ethtool_get_ts_info(struct net_device *netdev,
+ 			    BIT(HWTSTAMP_TX_ON) |
+ 			    BIT(HWTSTAMP_TX_ONESTEP_SYNC);
+ 	ts_info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) |
+-			      BIT(HWTSTAMP_FILTER_ALL);
++			      BIT(HWTSTAMP_FILTER_ALL) |
++			      BIT(HWTSTAMP_FILTER_PTP_V2_EVENT);
+ 	return 0;
+ }
+ 
+@@ -1074,7 +1075,6 @@ static int lan743x_ethtool_get_eee(struct net_device *netdev,
+ 	buf = lan743x_csr_read(adapter, MAC_CR);
+ 	if (buf & MAC_CR_EEE_EN_) {
+ 		eee->eee_enabled = true;
+-		eee->eee_active = !!(eee->advertised & eee->lp_advertised);
+ 		eee->tx_lpi_enabled = true;
+ 		/* EEE_TX_LPI_REQ_DLY & tx_lpi_timer are same uSec unit */
+ 		buf = lan743x_csr_read(adapter, MAC_EEE_TX_LPI_REQ_DLY_CNT);
+@@ -1189,16 +1189,11 @@ static int lan743x_ethtool_set_wol(struct net_device *netdev,
+ 			: -ENETDOWN;
+ }
+ #endif /* CONFIG_PM */
+-
+-static void lan743x_common_regs(struct net_device *dev,
+-				struct ethtool_regs *regs, void *p)
+-
++static void lan743x_common_regs(struct net_device *dev, void *p)
+ {
+ 	struct lan743x_adapter *adapter = netdev_priv(dev);
+ 	u32 *rb = p;
+-
+-	memset(p, 0, (MAX_LAN743X_ETH_REGS * sizeof(u32)));
+-
++	memset(p, 0, (MAX_LAN743X_ETH_COMMON_REGS * sizeof(u32)));
+ 	rb[ETH_PRIV_FLAGS] = adapter->flags;
+ 	rb[ETH_ID_REV]     = lan743x_csr_read(adapter, ID_REV);
+ 	rb[ETH_FPGA_REV]   = lan743x_csr_read(adapter, FPGA_REV);
+@@ -1220,17 +1215,152 @@ static void lan743x_common_regs(struct net_device *dev,
+ 	rb[ETH_WK_SRC]     = lan743x_csr_read(adapter, MAC_WK_SRC);
+ }
+ 
++static void lan743x_sgmii_regs(struct net_device *dev, void *p)
++{
++	struct lan743x_adapter *adp = netdev_priv(dev);
++	u32 *rb = p;
++	u16 idx;
++	int val;
++	struct {
++		u8 id;
++		u8 dev;
++		u16 addr;
++	} regs[] = {
++		{ ETH_SR_VSMMD_DEV_ID1,                MDIO_MMD_VEND1, 0x0002},
++		{ ETH_SR_VSMMD_DEV_ID2,                MDIO_MMD_VEND1, 0x0003},
++		{ ETH_SR_VSMMD_PCS_ID1,                MDIO_MMD_VEND1, 0x0004},
++		{ ETH_SR_VSMMD_PCS_ID2,                MDIO_MMD_VEND1, 0x0005},
++		{ ETH_SR_VSMMD_STS,                    MDIO_MMD_VEND1, 0x0008},
++		{ ETH_SR_VSMMD_CTRL,                   MDIO_MMD_VEND1, 0x0009},
++		{ ETH_SR_MII_CTRL,                     MDIO_MMD_VEND2, 0x0000},
++		{ ETH_SR_MII_STS,                      MDIO_MMD_VEND2, 0x0001},
++		{ ETH_SR_MII_DEV_ID1,                  MDIO_MMD_VEND2, 0x0002},
++		{ ETH_SR_MII_DEV_ID2,                  MDIO_MMD_VEND2, 0x0003},
++		{ ETH_SR_MII_AN_ADV,                   MDIO_MMD_VEND2, 0x0004},
++		{ ETH_SR_MII_LP_BABL,                  MDIO_MMD_VEND2, 0x0005},
++		{ ETH_SR_MII_EXPN,                     MDIO_MMD_VEND2, 0x0006},
++		{ ETH_SR_MII_EXT_STS,                  MDIO_MMD_VEND2, 0x000F},
++		{ ETH_SR_MII_TIME_SYNC_ABL,            MDIO_MMD_VEND2, 0x0708},
++		{ ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_LWR, MDIO_MMD_VEND2, 0x0709},
++		{ ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_UPR, MDIO_MMD_VEND2, 0x070A},
++		{ ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_LWR, MDIO_MMD_VEND2, 0x070B},
++		{ ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_UPR, MDIO_MMD_VEND2, 0x070C},
++		{ ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_LWR, MDIO_MMD_VEND2, 0x070D},
++		{ ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_UPR, MDIO_MMD_VEND2, 0x070E},
++		{ ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_LWR, MDIO_MMD_VEND2, 0x070F},
++		{ ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_UPR, MDIO_MMD_VEND2, 0x0710},
++		{ ETH_VR_MII_DIG_CTRL1,                MDIO_MMD_VEND2, 0x8000},
++		{ ETH_VR_MII_AN_CTRL,                  MDIO_MMD_VEND2, 0x8001},
++		{ ETH_VR_MII_AN_INTR_STS,              MDIO_MMD_VEND2, 0x8002},
++		{ ETH_VR_MII_TC,                       MDIO_MMD_VEND2, 0x8003},
++		{ ETH_VR_MII_DBG_CTRL,                 MDIO_MMD_VEND2, 0x8005},
++		{ ETH_VR_MII_EEE_MCTRL0,               MDIO_MMD_VEND2, 0x8006},
++		{ ETH_VR_MII_EEE_TXTIMER,              MDIO_MMD_VEND2, 0x8008},
++		{ ETH_VR_MII_EEE_RXTIMER,              MDIO_MMD_VEND2, 0x8009},
++		{ ETH_VR_MII_LINK_TIMER_CTRL,          MDIO_MMD_VEND2, 0x800A},
++		{ ETH_VR_MII_EEE_MCTRL1,               MDIO_MMD_VEND2, 0x800B},
++		{ ETH_VR_MII_DIG_STS,                  MDIO_MMD_VEND2, 0x8010},
++		{ ETH_VR_MII_ICG_ERRCNT1,              MDIO_MMD_VEND2, 0x8011},
++		{ ETH_VR_MII_GPIO,                     MDIO_MMD_VEND2, 0x8015},
++		{ ETH_VR_MII_EEE_LPI_STATUS,           MDIO_MMD_VEND2, 0x8016},
++		{ ETH_VR_MII_EEE_WKERR,                MDIO_MMD_VEND2, 0x8017},
++		{ ETH_VR_MII_MISC_STS,                 MDIO_MMD_VEND2, 0x8018},
++		{ ETH_VR_MII_RX_LSTS,                  MDIO_MMD_VEND2, 0x8020},
++		{ ETH_VR_MII_GEN2_GEN4_TX_BSTCTRL0,    MDIO_MMD_VEND2, 0x8038},
++		{ ETH_VR_MII_GEN2_GEN4_TX_LVLCTRL0,    MDIO_MMD_VEND2, 0x803A},
++		{ ETH_VR_MII_GEN2_GEN4_TXGENCTRL0,     MDIO_MMD_VEND2, 0x803C},
++		{ ETH_VR_MII_GEN2_GEN4_TXGENCTRL1,     MDIO_MMD_VEND2, 0x803D},
++		{ ETH_VR_MII_GEN4_TXGENCTRL2,          MDIO_MMD_VEND2, 0x803E},
++		{ ETH_VR_MII_GEN2_GEN4_TX_STS,         MDIO_MMD_VEND2, 0x8048},
++		{ ETH_VR_MII_GEN2_GEN4_RXGENCTRL0,     MDIO_MMD_VEND2, 0x8058},
++		{ ETH_VR_MII_GEN2_GEN4_RXGENCTRL1,     MDIO_MMD_VEND2, 0x8059},
++		{ ETH_VR_MII_GEN4_RXEQ_CTRL,           MDIO_MMD_VEND2, 0x805B},
++		{ ETH_VR_MII_GEN4_RXLOS_CTRL0,         MDIO_MMD_VEND2, 0x805D},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_CTRL0,     MDIO_MMD_VEND2, 0x8078},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_CTRL1,     MDIO_MMD_VEND2, 0x8079},
++		{ ETH_VR_MII_GEN2_GEN4_MPLL_STS,       MDIO_MMD_VEND2, 0x8088},
++		{ ETH_VR_MII_GEN2_GEN4_LVL_CTRL,       MDIO_MMD_VEND2, 0x8090},
++		{ ETH_VR_MII_GEN4_MISC_CTRL2,          MDIO_MMD_VEND2, 0x8093},
++		{ ETH_VR_MII_GEN2_GEN4_MISC_CTRL0,     MDIO_MMD_VEND2, 0x8099},
++		{ ETH_VR_MII_GEN2_GEN4_MISC_CTRL1,     MDIO_MMD_VEND2, 0x809A},
++		{ ETH_VR_MII_SNPS_CR_CTRL,             MDIO_MMD_VEND2, 0x80A0},
++		{ ETH_VR_MII_SNPS_CR_ADDR,             MDIO_MMD_VEND2, 0x80A1},
++		{ ETH_VR_MII_SNPS_CR_DATA,             MDIO_MMD_VEND2, 0x80A2},
++		{ ETH_VR_MII_DIG_CTRL2,                MDIO_MMD_VEND2, 0x80E1},
++		{ ETH_VR_MII_DIG_ERRCNT,               MDIO_MMD_VEND2, 0x80E2},
++	};
++	for (idx = 0; idx < ARRAY_SIZE(regs); idx++) {
++		val = lan743x_sgmii_read(adp, regs[idx].dev, regs[idx].addr);
++		if (val < 0)
++			rb[regs[idx].id] = 0xFFFF;
++		else
++			rb[regs[idx].id] = val;
++	}
++}
+ static int lan743x_get_regs_len(struct net_device *dev)
+ {
+-	return MAX_LAN743X_ETH_REGS * sizeof(u32);
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	u32 num_regs = MAX_LAN743X_ETH_COMMON_REGS;
++
++	if (adapter->is_sgmii_en)
++		num_regs += MAX_LAN743X_ETH_SGMII_REGS;
++	return num_regs * sizeof(u32);
+ }
+ 
+ static void lan743x_get_regs(struct net_device *dev,
+ 			     struct ethtool_regs *regs, void *p)
+ {
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	int regs_len;
++
++	regs_len = lan743x_get_regs_len(dev);
++	memset(p, 0, regs_len);
+ 	regs->version = LAN743X_ETH_REG_VERSION;
++	regs->len = regs_len;
++	lan743x_common_regs(dev, p);
++	p = (u32 *)p + MAX_LAN743X_ETH_COMMON_REGS;
++	if (adapter->is_sgmii_en) {
++		lan743x_sgmii_regs(dev, p);
++		p = (u32 *)p + MAX_LAN743X_ETH_SGMII_REGS;
++	}
++}
++
++static void lan743x_get_pauseparam(struct net_device *dev,
++				   struct ethtool_pauseparam *pause)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	struct lan743x_phy *phy = &adapter->phy;
+ 
+-	lan743x_common_regs(dev, regs, p);
++	if (phy->fc_request_control & FLOW_CTRL_TX)
++		pause->tx_pause = 1;
++	if (phy->fc_request_control & FLOW_CTRL_RX)
++		pause->rx_pause = 1;
++	pause->autoneg = phy->fc_autoneg;
++}
++
++static int lan743x_set_pauseparam(struct net_device *dev,
++				  struct ethtool_pauseparam *pause)
++{
++	struct lan743x_adapter *adapter = netdev_priv(dev);
++	struct phy_device *phydev = dev->phydev;
++	struct lan743x_phy *phy = &adapter->phy;
++
++	if (!phydev)
++		return -ENODEV;
++	if (!phy_validate_pause(phydev, pause))
++		return -EINVAL;
++	phy->fc_request_control = 0;
++	if (pause->rx_pause)
++		phy->fc_request_control |= FLOW_CTRL_RX;
++	if (pause->tx_pause)
++		phy->fc_request_control |= FLOW_CTRL_TX;
++	phy->fc_autoneg = pause->autoneg;
++	if (pause->autoneg == AUTONEG_DISABLE)
++		lan743x_mac_flow_ctrl_set_enables(adapter, pause->tx_pause,
++						  pause->rx_pause);
++	else
++		phy_set_asym_pause(phydev, pause->rx_pause,  pause->tx_pause);
++	return 0;
+ }
+ 
+ const struct ethtool_ops lan743x_ethtool_ops = {
+@@ -1259,6 +1389,8 @@ const struct ethtool_ops lan743x_ethtool_ops = {
+ 	.set_link_ksettings = phy_ethtool_set_link_ksettings,
+ 	.get_regs_len = lan743x_get_regs_len,
+ 	.get_regs = lan743x_get_regs,
++	.get_pauseparam = lan743x_get_pauseparam,
++	.set_pauseparam = lan743x_set_pauseparam,
+ #ifdef CONFIG_PM
+ 	.get_wol = lan743x_ethtool_get_wol,
+ 	.set_wol = lan743x_ethtool_set_wol,
+diff --git a/drivers/net/ethernet/microchip/lan743x_ethtool.h b/drivers/net/ethernet/microchip/lan743x_ethtool.h
+index 7f5996a52..978c3273e 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ethtool.h
++++ b/drivers/net/ethernet/microchip/lan743x_ethtool.h
+@@ -29,7 +29,75 @@ enum {
+ 	ETH_WK_SRC,
+ 
+ 	/* Add new registers above */
+-	MAX_LAN743X_ETH_REGS
++	MAX_LAN743X_ETH_COMMON_REGS
++};
++
++enum {
++	/* SGMII Register */
++	ETH_SR_VSMMD_DEV_ID1,
++	ETH_SR_VSMMD_DEV_ID2,
++	ETH_SR_VSMMD_PCS_ID1,
++	ETH_SR_VSMMD_PCS_ID2,
++	ETH_SR_VSMMD_STS,
++	ETH_SR_VSMMD_CTRL,
++	ETH_SR_MII_CTRL,
++	ETH_SR_MII_STS,
++	ETH_SR_MII_DEV_ID1,
++	ETH_SR_MII_DEV_ID2,
++	ETH_SR_MII_AN_ADV,
++	ETH_SR_MII_LP_BABL,
++	ETH_SR_MII_EXPN,
++	ETH_SR_MII_EXT_STS,
++	ETH_SR_MII_TIME_SYNC_ABL,
++	ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_TX_MAX_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_TX_MIN_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_RX_MAX_DLY_UPR,
++	ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_LWR,
++	ETH_SR_MII_TIME_SYNC_RX_MIN_DLY_UPR,
++	ETH_VR_MII_DIG_CTRL1,
++	ETH_VR_MII_AN_CTRL,
++	ETH_VR_MII_AN_INTR_STS,
++	ETH_VR_MII_TC,
++	ETH_VR_MII_DBG_CTRL,
++	ETH_VR_MII_EEE_MCTRL0,
++	ETH_VR_MII_EEE_TXTIMER,
++	ETH_VR_MII_EEE_RXTIMER,
++	ETH_VR_MII_LINK_TIMER_CTRL,
++	ETH_VR_MII_EEE_MCTRL1,
++	ETH_VR_MII_DIG_STS,
++	ETH_VR_MII_ICG_ERRCNT1,
++	ETH_VR_MII_GPIO,
++	ETH_VR_MII_EEE_LPI_STATUS,
++	ETH_VR_MII_EEE_WKERR,
++	ETH_VR_MII_MISC_STS,
++	ETH_VR_MII_RX_LSTS,
++	ETH_VR_MII_GEN2_GEN4_TX_BSTCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TX_LVLCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TXGENCTRL0,
++	ETH_VR_MII_GEN2_GEN4_TXGENCTRL1,
++	ETH_VR_MII_GEN4_TXGENCTRL2,
++	ETH_VR_MII_GEN2_GEN4_TX_STS,
++	ETH_VR_MII_GEN2_GEN4_RXGENCTRL0,
++	ETH_VR_MII_GEN2_GEN4_RXGENCTRL1,
++	ETH_VR_MII_GEN4_RXEQ_CTRL,
++	ETH_VR_MII_GEN4_RXLOS_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MPLL_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MPLL_CTRL1,
++	ETH_VR_MII_GEN2_GEN4_MPLL_STS,
++	ETH_VR_MII_GEN2_GEN4_LVL_CTRL,
++	ETH_VR_MII_GEN4_MISC_CTRL2,
++	ETH_VR_MII_GEN2_GEN4_MISC_CTRL0,
++	ETH_VR_MII_GEN2_GEN4_MISC_CTRL1,
++	ETH_VR_MII_SNPS_CR_CTRL,
++	ETH_VR_MII_SNPS_CR_ADDR,
++	ETH_VR_MII_SNPS_CR_DATA,
++	ETH_VR_MII_DIG_CTRL2,
++	ETH_VR_MII_DIG_ERRCNT,
++	/* Add new registers above */
++	MAX_LAN743X_ETH_SGMII_REGS
+ };
+ 
+ extern const struct ethtool_ops lan743x_ethtool_ops;
+diff --git a/drivers/net/ethernet/microchip/lan743x_main.c b/drivers/net/ethernet/microchip/lan743x_main.c
+index e804613fa..fddad7462 100644
+--- a/drivers/net/ethernet/microchip/lan743x_main.c
++++ b/drivers/net/ethernet/microchip/lan743x_main.c
+@@ -164,7 +164,7 @@ static int lan743x_csr_wait_for_bit(struct lan743x_adapter *adapter,
+ 	u32 data;
+ 
+ 	return readx_poll_timeout(LAN743X_CSR_READ_OP, offset, data,
+-				  target_value == ((data & bit_mask) ? 1 : 0),
++				  target_value == !!(data & bit_mask),
+ 				  usleep_max, usleep_min * count);
+ }
+ 
+@@ -172,28 +172,20 @@ static int lan743x_csr_init(struct lan743x_adapter *adapter)
+ {
+ 	struct lan743x_csr *csr = &adapter->csr;
+ 	resource_size_t bar_start, bar_length;
+-	int result;
+-
+ 	bar_start = pci_resource_start(adapter->pdev, 0);
+ 	bar_length = pci_resource_len(adapter->pdev, 0);
+ 	csr->csr_address = devm_ioremap(&adapter->pdev->dev,
+ 					bar_start, bar_length);
+-	if (!csr->csr_address) {
+-		result = -ENOMEM;
+-		goto clean_up;
+-	}
+-
++	if (!csr->csr_address)
++		return -ENOMEM;
+ 	csr->id_rev = lan743x_csr_read(adapter, ID_REV);
+ 	csr->fpga_rev = lan743x_csr_read(adapter, FPGA_REV);
+ 	netif_info(adapter, probe, adapter->netdev,
+ 		   "ID_REV = 0x%08X, FPGA_REV = %d.%d\n",
+ 		   csr->id_rev,	FPGA_REV_GET_MAJOR_(csr->fpga_rev),
+ 		   FPGA_REV_GET_MINOR_(csr->fpga_rev));
+-	if (!ID_REV_IS_VALID_CHIP_ID_(csr->id_rev)) {
+-		result = -ENODEV;
+-		goto clean_up;
+-	}
+-
++	if (!ID_REV_IS_VALID_CHIP_ID_(csr->id_rev))
++		return -ENODEV;
+ 	csr->flags = LAN743X_CSR_FLAG_SUPPORTS_INTR_AUTO_SET_CLR;
+ 	switch (csr->id_rev & ID_REV_CHIP_REV_MASK_) {
+ 	case ID_REV_CHIP_REV_A0_:
+@@ -205,12 +197,10 @@ static int lan743x_csr_init(struct lan743x_adapter *adapter)
+ 		break;
+ 	}
+ 
+-	result = lan743x_csr_light_reset(adapter);
+-	if (result)
+-		goto clean_up;
++	if (lan743x_csr_light_reset(adapter))
++		return lan743x_csr_light_reset(adapter);
+ 	return 0;
+-clean_up:
+-	return result;
++
+ }
+ 
+ static void lan743x_intr_software_isr(struct lan743x_adapter *adapter)
+@@ -952,7 +942,7 @@ static int lan743x_sgmii_wait_till_not_busy(struct lan743x_adapter *adapter)
+ 	return ret;
+ }
+ 
+-static int lan743x_sgmii_read(struct lan743x_adapter *adapter, u8 mmd, u16 addr)
++int lan743x_sgmii_read(struct lan743x_adapter *adapter, u8 mmd, u16 addr)
+ {
+ 	u32 mmd_access;
+ 	int ret;
+@@ -1339,8 +1329,8 @@ static void lan743x_mac_close(struct lan743x_adapter *adapter)
+ 				 1, 1000, 20000, 100);
+ }
+ 
+-static void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
+-					      bool tx_enable, bool rx_enable)
++void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
++				       bool tx_enable, bool rx_enable)
+ {
+ 	u32 flow_setting = 0;
+ 
+@@ -1436,15 +1426,6 @@ static void lan743x_phy_link_status_change(struct net_device *netdev)
+ 		int local_advertisement = 0;
+ 
+ 		data = lan743x_csr_read(adapter, MAC_CR);
+-
+-		/* set interface mode */
+-		if (phy_interface_is_rgmii(phydev))
+-			/* RGMII */
+-			data &= ~MAC_CR_MII_EN_;
+-		else
+-			/* GMII */
+-			data |= MAC_CR_MII_EN_;
+-
+ 		/* set duplex mode */
+ 		if (phydev->duplex)
+ 			data |= MAC_CR_DPX_;
+@@ -1490,16 +1471,40 @@ static void lan743x_phy_link_status_change(struct net_device *netdev)
+ static void lan743x_phy_close(struct lan743x_adapter *adapter)
+ {
+ 	struct net_device *netdev = adapter->netdev;
+-
++	struct phy_device *phydev = netdev->phydev;
+ 	phy_stop(netdev->phydev);
+ 	phy_disconnect(netdev->phydev);
+-	netdev->phydev = NULL;
++	/* using phydev here as phy_disconnect NULLs netdev->phydev */
++	if (phy_is_pseudo_fixed_link(phydev))
++		fixed_phy_unregister(phydev);
++}
++
++static void lan743x_phy_interface_select(struct lan743x_adapter *adapter)
++{
++	u32 id_rev;
++	u32 data;
++
++	data = lan743x_csr_read(adapter, MAC_CR);
++	id_rev = adapter->csr.id_rev & ID_REV_ID_MASK_;
++	if (adapter->is_pci11x1x && adapter->is_sgmii_en)
++		adapter->phy_interface = PHY_INTERFACE_MODE_SGMII;
++	else if (id_rev == ID_REV_ID_LAN7430_)
++		adapter->phy_interface = PHY_INTERFACE_MODE_GMII;
++	else if ((id_rev == ID_REV_ID_LAN7431_) && (data & MAC_CR_MII_EN_))
++		adapter->phy_interface = PHY_INTERFACE_MODE_MII;
++	else
++		adapter->phy_interface = PHY_INTERFACE_MODE_RGMII;
+ }
+ 
+ static int lan743x_phy_open(struct lan743x_adapter *adapter)
+ {
+ 	struct net_device *netdev = adapter->netdev;
+ 	struct lan743x_phy *phy = &adapter->phy;
++	struct fixed_phy_status fphy_status = {
++		.link = 1,
++		.speed = SPEED_1000,
++		.duplex = DUPLEX_FULL,
++	};
+ 	struct phy_device *phydev;
+ 	int ret = -EIO;
+ 
+@@ -1510,17 +1515,23 @@ static int lan743x_phy_open(struct lan743x_adapter *adapter)
+ 	if (!phydev) {
+ 		/* try internal phy */
+ 		phydev = phy_find_first(adapter->mdiobus);
+-		if (!phydev)
+-			goto return_error;
+-
+-		if (adapter->is_pci11x1x)
+-			ret = phy_connect_direct(netdev, phydev,
+-						 lan743x_phy_link_status_change,
+-						 PHY_INTERFACE_MODE_RGMII);
+-		else
++		if (!phydev)	{
++			if ((adapter->csr.id_rev & ID_REV_ID_MASK_) ==
++					ID_REV_ID_LAN7431_) {
++				phydev = fixed_phy_register(PHY_POLL,
++							    &fphy_status, NULL);
++				if (IS_ERR(phydev)) {
++					netdev_err(netdev, "No PHY/fixed_PHY found\n");
++					return PTR_ERR(phydev);
++				}
++			} else {
++				goto return_error;
++				}
++		}
++		lan743x_phy_interface_select(adapter);
+ 			ret = phy_connect_direct(netdev, phydev,
+ 						 lan743x_phy_link_status_change,
+-						 PHY_INTERFACE_MODE_GMII);
++					 adapter->phy_interface);
+ 		if (ret)
+ 			goto return_error;
+ 	}
+@@ -1858,6 +1869,49 @@ static int lan743x_tx_get_avail_desc(struct lan743x_tx *tx)
+ 		return last_head - last_tail - 1;
+ }
+ 
++static void lan743x_rx_cfg_b_tstamp_config(struct lan743x_adapter *adapter,
++					   int rx_ts_config)
++{
++	int channel_number;
++	int index;
++	u32 data;
++
++	for (index = 0; index < LAN743X_USED_RX_CHANNELS; index++) {
++		channel_number = adapter->rx[index].channel_number;
++		data = lan743x_csr_read(adapter, RX_CFG_B(channel_number));
++		data &= RX_CFG_B_TS_MASK_;
++		data |= rx_ts_config;
++		lan743x_csr_write(adapter, RX_CFG_B(channel_number),
++				  data);
++	}
++}
++
++int lan743x_rx_set_tstamp_mode(struct lan743x_adapter *adapter,
++			       int rx_filter)
++{
++	u32 data;
++
++	switch (rx_filter) {
++	case HWTSTAMP_FILTER_PTP_V2_EVENT:
++			lan743x_rx_cfg_b_tstamp_config(adapter,
++						       RX_CFG_B_TS_DESCR_EN_);
++			data = lan743x_csr_read(adapter, PTP_RX_TS_CFG);
++			data |= PTP_RX_TS_CFG_EVENT_MSGS_;
++			lan743x_csr_write(adapter, PTP_RX_TS_CFG, data);
++			break;
++	case HWTSTAMP_FILTER_NONE:
++			lan743x_rx_cfg_b_tstamp_config(adapter,
++						       RX_CFG_B_TS_NONE_);
++			break;
++	case HWTSTAMP_FILTER_ALL:
++			lan743x_rx_cfg_b_tstamp_config(adapter,
++						       RX_CFG_B_TS_ALL_RX_);
++			break;
++	default:
++			return -ERANGE;
++	}
++	return 0;
++}
+ void lan743x_tx_set_timestamping_mode(struct lan743x_tx *tx,
+ 				      bool enable_timestamping,
+ 				      bool enable_onestep_sync)
+@@ -2932,7 +2986,6 @@ static int lan743x_rx_open(struct lan743x_rx *rx)
+ 		data |= RX_CFG_B_RX_PAD_2_;
+ 	data &= ~RX_CFG_B_RX_RING_LEN_MASK_;
+ 	data |= ((rx->ring_size) & RX_CFG_B_RX_RING_LEN_MASK_);
+-	data |= RX_CFG_B_TS_ALL_RX_;
+ 	if (!(adapter->csr.flags & LAN743X_CSR_FLAG_IS_A0))
+ 		data |= RX_CFG_B_RDMABL_512_;
+ 
+diff --git a/drivers/net/ethernet/microchip/lan743x_main.h b/drivers/net/ethernet/microchip/lan743x_main.h
+index 67877d3b6..f6354de2c 100644
+--- a/drivers/net/ethernet/microchip/lan743x_main.h
++++ b/drivers/net/ethernet/microchip/lan743x_main.h
+@@ -522,7 +522,8 @@
+ 	(((u32)(rx_latency)) & 0x0000FFFF)
+ #define PTP_CAP_INFO				(0x0A60)
+ #define PTP_CAP_INFO_TX_TS_CNT_GET_(reg_val)	(((reg_val) & 0x00000070) >> 4)
+-
++#define PTP_RX_TS_CFG				(0x0A68)
++#define PTP_RX_TS_CFG_EVENT_MSGS_               GENMASK(3, 0)
+ #define PTP_TX_MOD				(0x0AA4)
+ #define PTP_TX_MOD_TX_PTP_SYNC_TS_INSERT_	(0x10000000)
+ 
+@@ -657,6 +658,9 @@
+ 
+ #define RX_CFG_B(channel)			(0xC44 + ((channel) << 6))
+ #define RX_CFG_B_TS_ALL_RX_			BIT(29)
++#define RX_CFG_B_TS_DESCR_EN_			BIT(28)
++#define RX_CFG_B_TS_NONE_			0
++#define RX_CFG_B_TS_MASK_			(0xCFFFFFFF)
+ #define RX_CFG_B_RX_PAD_MASK_			(0x03000000)
+ #define RX_CFG_B_RX_PAD_0_			(0x00000000)
+ #define RX_CFG_B_RX_PAD_2_			(0x02000000)
+@@ -991,6 +995,8 @@ struct lan743x_rx {
+ 	struct sk_buff *skb_head, *skb_tail;
+ };
+ 
++int lan743x_rx_set_tstamp_mode(struct lan743x_adapter *adapter,
++			       int rx_filter);
+ /* SGMII Link Speed Duplex status */
+ enum lan743x_sgmii_lsd {
+ 	POWER_DOWN = 0,
+@@ -1042,6 +1048,7 @@ struct lan743x_adapter {
+ #define LAN743X_ADAPTER_FLAG_OTP		BIT(0)
+ 	u32			flags;
+ 	u32			hw_cfg;
++	phy_interface_t		phy_interface;
+ };
+ 
+ #define LAN743X_COMPONENT_FLAG_RX(channel)  BIT(20 + (channel))
+@@ -1066,8 +1073,7 @@ struct lan743x_adapter {
+ #define DMA_DESCRIPTOR_SPACING_32       (32)
+ #define DMA_DESCRIPTOR_SPACING_64       (64)
+ #define DMA_DESCRIPTOR_SPACING_128      (128)
+-#define DEFAULT_DMA_DESCRIPTOR_SPACING  (L1_CACHE_BYTES)
+-
++#define DEFAULT_DMA_DESCRIPTOR_SPACING  (DMA_DESCRIPTOR_SPACING_16)
+ #define DMAC_CHANNEL_STATE_SET(start_bit, stop_bit) \
+ 	(((start_bit) ? 2 : 0) | ((stop_bit) ? 1 : 0))
+ #define DMAC_CHANNEL_STATE_INITIAL      DMAC_CHANNEL_STATE_SET(0, 0)
+@@ -1159,5 +1165,9 @@ u32 lan743x_csr_read(struct lan743x_adapter *adapter, int offset);
+ void lan743x_csr_write(struct lan743x_adapter *adapter, int offset, u32 data);
+ int lan743x_hs_syslock_acquire(struct lan743x_adapter *adapter, u16 timeout);
+ void lan743x_hs_syslock_release(struct lan743x_adapter *adapter);
++void lan743x_mac_flow_ctrl_set_enables(struct lan743x_adapter *adapter,
++				       bool tx_enable, bool rx_enable);
++int lan743x_sgmii_read(struct lan743x_adapter *adapter, u8 mmd, u16 addr);
+ 
+ #endif /* _LAN743X_H */
++
+diff --git a/drivers/net/ethernet/microchip/lan743x_ptp.c b/drivers/net/ethernet/microchip/lan743x_ptp.c
+index da3ea905a..400e189e8 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ptp.c
++++ b/drivers/net/ethernet/microchip/lan743x_ptp.c
+@@ -1534,6 +1534,8 @@ int lan743x_ptp_open(struct lan743x_adapter *adapter)
+ 	temp = lan743x_csr_read(adapter, PTP_TX_MOD2);
+ 	temp |= PTP_TX_MOD2_TX_PTP_CLR_UDPV4_CHKSUM_;
+ 	lan743x_csr_write(adapter, PTP_TX_MOD2, temp);
++	/* Default Timestamping */
++	lan743x_rx_set_tstamp_mode(adapter, HWTSTAMP_FILTER_NONE);
+ 	lan743x_ptp_enable(adapter);
+ 	lan743x_csr_write(adapter, INT_EN_SET, INT_BIT_1588_);
+ 	lan743x_csr_write(adapter, PTP_INT_EN_SET,
+@@ -1694,7 +1696,8 @@ static void lan743x_ptp_enable(struct lan743x_adapter *adapter)
+ static void lan743x_ptp_disable(struct lan743x_adapter *adapter)
+ {
+ 	struct lan743x_ptp *ptp = &adapter->ptp;
+-
++	/* Disable Timestamping */
++	lan743x_rx_set_tstamp_mode(adapter, HWTSTAMP_FILTER_NONE);
+ 	mutex_lock(&ptp->command_lock);
+ 	if (!lan743x_ptp_is_enabled(adapter)) {
+ 		netif_warn(adapter, drv, adapter->netdev,
+@@ -1826,7 +1829,7 @@ int lan743x_ptp_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ 		ret = -EINVAL;
+ 		break;
+ 	}
+-
++	ret = lan743x_rx_set_tstamp_mode(adapter, config.rx_filter);
+ 	if (!ret)
+ 		return copy_to_user(ifr->ifr_data, &config,
+ 			sizeof(config)) ? -EFAULT : 0;

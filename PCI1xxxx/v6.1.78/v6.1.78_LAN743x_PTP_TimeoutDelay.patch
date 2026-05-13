@@ -1,0 +1,25 @@
+diff --git a/drivers/net/ethernet/microchip/lan743x_ptp.c b/drivers/net/ethernet/microchip/lan743x_ptp.c
+index d17938def7b2..97c9c358656c 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ptp.c
++++ b/drivers/net/ethernet/microchip/lan743x_ptp.c
+@@ -58,7 +58,7 @@ int lan743x_gpio_init(struct lan743x_adapter *adapter)
+ static void lan743x_ptp_wait_till_cmd_done(struct lan743x_adapter *adapter,
+ 					   u32 bit_mask)
+ {
+-	int timeout = 1000;
++	int timeout = PTP_CMD_CTL_TIMEOUT_TIMER;
+ 	u32 data = 0;
+ 
+ 	while (timeout &&
+diff --git a/drivers/net/ethernet/microchip/lan743x_ptp.h b/drivers/net/ethernet/microchip/lan743x_ptp.h
+index fe0d1d00cc0c..bc145672eb6e 100644
+--- a/drivers/net/ethernet/microchip/lan743x_ptp.h
++++ b/drivers/net/ethernet/microchip/lan743x_ptp.h
+@@ -21,6 +21,7 @@
+ #define LAN743X_PTP_N_EXTTS		4
+ #define LAN743X_PTP_N_PPS		0
+ #define PCI11X1X_PTP_IO_MAX_CHANNELS	8
++#define PTP_CMD_CTL_TIMEOUT_TIMER      50
+ 
+ struct lan743x_adapter;
+ 

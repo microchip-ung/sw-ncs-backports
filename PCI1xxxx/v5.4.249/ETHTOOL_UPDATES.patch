@@ -1,0 +1,2231 @@
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 9e8cf64f0..f2e896982 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -360,6 +360,7 @@ int phy_ethtool_ksettings_set(struct phy_device *phydev,
+ 	linkmode_mod_bit(ETHTOOL_LINK_MODE_Autoneg_BIT,
+ 			 phydev->advertising, autoneg == AUTONEG_ENABLE);
+ 
++	phydev->master_slave_set = cmd->base.master_slave_cfg;
+ 	phydev->mdix_ctrl = cmd->base.eth_tp_mdix_ctrl;
+ 
+ 	/* Restart the PHY */
+@@ -379,6 +380,8 @@ void phy_ethtool_ksettings_get(struct phy_device *phydev,
+ 
+ 	cmd->base.speed = phydev->speed;
+ 	cmd->base.duplex = phydev->duplex;
++	cmd->base.master_slave_cfg = phydev->master_slave_get;
++	cmd->base.master_slave_state = phydev->master_slave_state;
+ 	if (phydev->interface == PHY_INTERFACE_MODE_MOCA)
+ 		cmd->base.port = PORT_BNC;
+ 	else
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index 388799985..db070d6ed 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -1670,6 +1670,84 @@ int genphy_setup_forced(struct phy_device *phydev)
+ }
+ EXPORT_SYMBOL(genphy_setup_forced);
+ 
++static int genphy_setup_master_slave(struct phy_device *phydev)
++{
++	u16 ctl = 0;
++
++	if (!phydev->is_gigabit_capable)
++		return 0;
++
++	switch (phydev->master_slave_set) {
++	case MASTER_SLAVE_CFG_MASTER_PREFERRED:
++		ctl |= CTL1000_PREFER_MASTER;
++		break;
++	case MASTER_SLAVE_CFG_SLAVE_PREFERRED:
++		break;
++	case MASTER_SLAVE_CFG_MASTER_FORCE:
++		ctl |= CTL1000_AS_MASTER;
++		fallthrough;
++	case MASTER_SLAVE_CFG_SLAVE_FORCE:
++		ctl |= CTL1000_ENABLE_MASTER;
++		break;
++	case MASTER_SLAVE_CFG_UNKNOWN:
++	case MASTER_SLAVE_CFG_UNSUPPORTED:
++		return 0;
++	default:
++		phydev_warn(phydev, "Unsupported Master/Slave mode\n");
++		return -EOPNOTSUPP;
++	}
++
++	return phy_modify_changed(phydev, MII_CTRL1000,
++				  (CTL1000_ENABLE_MASTER | CTL1000_AS_MASTER |
++				   CTL1000_PREFER_MASTER), ctl);
++}
++
++static int genphy_read_master_slave(struct phy_device *phydev)
++{
++	int cfg, state;
++	int val;
++
++	phydev->master_slave_get = MASTER_SLAVE_CFG_UNKNOWN;
++	phydev->master_slave_state = MASTER_SLAVE_STATE_UNKNOWN;
++
++	val = phy_read(phydev, MII_CTRL1000);
++	if (val < 0)
++		return val;
++
++	if (val & CTL1000_ENABLE_MASTER) {
++		if (val & CTL1000_AS_MASTER)
++			cfg = MASTER_SLAVE_CFG_MASTER_FORCE;
++		else
++			cfg = MASTER_SLAVE_CFG_SLAVE_FORCE;
++	} else {
++		if (val & CTL1000_PREFER_MASTER)
++			cfg = MASTER_SLAVE_CFG_MASTER_PREFERRED;
++		else
++			cfg = MASTER_SLAVE_CFG_SLAVE_PREFERRED;
++	}
++
++	val = phy_read(phydev, MII_STAT1000);
++	if (val < 0)
++		return val;
++
++	if (val & LPA_1000MSFAIL) {
++		state = MASTER_SLAVE_STATE_ERR;
++	} else if (phydev->link) {
++		/* this bits are valid only for active link */
++		if (val & LPA_1000MSRES)
++			state = MASTER_SLAVE_STATE_MASTER;
++		else
++			state = MASTER_SLAVE_STATE_SLAVE;
++	} else {
++		state = MASTER_SLAVE_STATE_UNKNOWN;
++	}
++
++	phydev->master_slave_get = cfg;
++	phydev->master_slave_state = state;
++
++	return 0;
++}
++
+ /**
+  * genphy_restart_aneg - Enable and Restart Autonegotiation
+  * @phydev: target phy_device struct
+@@ -1698,6 +1776,12 @@ int __genphy_config_aneg(struct phy_device *phydev, bool changed)
+ 	if (genphy_config_eee_advert(phydev))
+ 		changed = true;
+ 
++	err = genphy_setup_master_slave(phydev);
++	if (err < 0)
++		return err;
++	else if (err)
++		changed = true;
++
+ 	if (AUTONEG_ENABLE != phydev->autoneg)
+ 		return genphy_setup_forced(phydev);
+ 
+@@ -1864,12 +1948,19 @@ int genphy_read_status(struct phy_device *phydev)
+ 	/* why bother the PHY if nothing can have changed */
+ 	if (phydev->autoneg == AUTONEG_ENABLE && old_link && phydev->link)
+ 		return 0;
+-
++	phydev->master_slave_get = MASTER_SLAVE_CFG_UNSUPPORTED;
++	phydev->master_slave_state = MASTER_SLAVE_STATE_UNSUPPORTED;
+ 	phydev->speed = SPEED_UNKNOWN;
+ 	phydev->duplex = DUPLEX_UNKNOWN;
+ 	phydev->pause = 0;
+ 	phydev->asym_pause = 0;
+ 
++	if (phydev->is_gigabit_capable) {
++		err = genphy_read_master_slave(phydev);
++		if (err < 0)
++			return err;
++	}
++
+ 	err = genphy_read_lpa(phydev);
+ 	if (err < 0)
+ 		return err;
+diff --git a/include/linux/ethtool_netlink.h b/include/linux/ethtool_netlink.h
+new file mode 100644
+index 000000000..dd9a51057
+--- /dev/null
++++ b/include/linux/ethtool_netlink.h
+@@ -0,0 +1,13 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _LINUX_ETHTOOL_NETLINK_H_
++#define _LINUX_ETHTOOL_NETLINK_H_
++
++#include <uapi/linux/ethtool_netlink.h>
++#include <linux/ethtool.h>
++
++enum ethtool_multicast_groups {
++	ETHNL_MCGRP_MONITOR,
++};
++
++#endif /* _LINUX_ETHTOOL_NETLINK_H_ */
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 8dea4b53d..0b29df6d6 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -4421,6 +4421,14 @@ struct netdev_notifier_bonding_info {
+ 
+ void netdev_bonding_info_change(struct net_device *dev,
+ 				struct netdev_bonding_info *bonding_info);
++#if IS_ENABLED(CONFIG_ETHTOOL_NETLINK)
++void ethtool_notify(struct net_device *dev, unsigned int cmd, const void *data);
++#else
++static inline void ethtool_notify(struct net_device *dev, unsigned int cmd,
++				  const void *data)
++{
++}
++#endif
+ 
+ static inline
+ struct sk_buff *skb_gso_segment(struct sk_buff *skb, netdev_features_t features)
+diff --git a/include/linux/netlink.h b/include/linux/netlink.h
+index 205fa7b1f..6e74ba672 100644
+--- a/include/linux/netlink.h
++++ b/include/linux/netlink.h
+@@ -119,6 +119,15 @@ static inline void nl_set_extack_cookie_u64(struct netlink_ext_ack *extack,
+ 	extack->cookie_len = sizeof(__cookie);
+ }
+ 
++static inline void nl_set_extack_cookie_u32(struct netlink_ext_ack *extack,
++					    u32 cookie)
++{
++	if (!extack)
++		return;
++	memcpy(extack->cookie, &cookie, sizeof(cookie));
++	extack->cookie_len = sizeof(cookie);
++}
++
+ void netlink_kernel_release(struct sock *sk);
+ int __netlink_change_ngroups(struct sock *sk, unsigned int groups);
+ int netlink_change_ngroups(struct sock *sk, unsigned int groups);
+diff --git a/include/linux/phy.h b/include/linux/phy.h
+index 80750783b..d1c520697 100644
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@ -21,6 +21,7 @@
+ #include <linux/timer.h>
+ #include <linux/workqueue.h>
+ #include <linux/mod_devicetable.h>
++#include <linux/iopoll.h>
+ 
+ #include <linux/atomic.h>
+ 
+@@ -252,6 +253,13 @@ struct mii_bus {
+ 	int reset_delay_us;
+ 	/* RESET GPIO descriptor pointer */
+ 	struct gpio_desc *reset_gpiod;
++
++	enum {
++		MDIOBUS_NO_CAP = 0,
++		MDIOBUS_C22,
++		MDIOBUS_C45,
++		MDIOBUS_C22_C45,
++	} probe_capabilities;
+ };
+ #define to_mii_bus(d) container_of(d, struct mii_bus, dev)
+ 
+@@ -399,6 +407,9 @@ struct phy_device {
+ 	int duplex;
+ 	int pause;
+ 	int asym_pause;
++	u8 master_slave_get;
++	u8 master_slave_set;
++	u8 master_slave_state;
+ 
+ 	/* Union of PHY and Attached devices' supported link modes */
+ 	/* See ethtool.h for more info */
+@@ -684,6 +695,8 @@ static inline bool phy_is_started(struct phy_device *phydev)
+ void phy_resolve_aneg_pause(struct phy_device *phydev);
+ void phy_resolve_aneg_linkmode(struct phy_device *phydev);
+ 
++#define phydev_read(regnum)        phy_read(phydev, regnum)
++
+ /**
+  * phy_read - Convenience function for reading a given PHY register
+  * @phydev: the phy_device struct
+@@ -698,6 +711,19 @@ static inline int phy_read(struct phy_device *phydev, u32 regnum)
+ 	return mdiobus_read(phydev->mdio.bus, phydev->mdio.addr, regnum);
+ }
+ 
++#define phy_read_poll_timeout(phydev, regnum, val, cond, sleep_us, \
++			      timeout_us, sleep_before_read) \
++({ \
++	int __ret = readx_poll_timeout(phydev_read, regnum, val, (cond) || val < 0, \
++				       sleep_us, timeout_us); \
++	if (val <  0) \
++		__ret = val; \
++	if (__ret) \
++		phydev_err(phydev, "%s failed: %d\n", __func__, __ret); \
++	__ret; \
++})
++
++
+ /**
+  * __phy_read - convenience function for reading a given PHY register
+  * @phydev: the phy_device struct
+diff --git a/include/uapi/linux/ethtool.h b/include/uapi/linux/ethtool.h
+index 8d465e532..93116e205 100644
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@ -1643,6 +1643,18 @@ static inline int ethtool_validate_duplex(__u8 duplex)
+ 	return 0;
+ }
+ 
++#define MASTER_SLAVE_CFG_UNSUPPORTED		0
++#define MASTER_SLAVE_CFG_UNKNOWN		1
++#define MASTER_SLAVE_CFG_MASTER_PREFERRED	2
++#define MASTER_SLAVE_CFG_SLAVE_PREFERRED	3
++#define MASTER_SLAVE_CFG_MASTER_FORCE		4
++#define MASTER_SLAVE_CFG_SLAVE_FORCE		5
++#define MASTER_SLAVE_STATE_UNSUPPORTED		0
++#define MASTER_SLAVE_STATE_UNKNOWN		1
++#define MASTER_SLAVE_STATE_MASTER		2
++#define MASTER_SLAVE_STATE_SLAVE		3
++#define MASTER_SLAVE_STATE_ERR			4
++
+ /* Which connector port. */
+ #define PORT_TP			0x00
+ #define PORT_AUI		0x01
+@@ -1879,7 +1891,9 @@ struct ethtool_link_settings {
+ 	__u8	eth_tp_mdix_ctrl;
+ 	__s8	link_mode_masks_nwords;
+ 	__u8	transceiver;
+-	__u8	reserved1[3];
++	__u8	master_slave_cfg;
++	__u8	master_slave_state;
++	__u8	reserved1[1];
+ 	__u32	reserved[7];
+ 	__u32	link_mode_masks[0];
+ 	/* layout of link_mode_masks fields:
+diff --git a/include/uapi/linux/ethtool_netlink.h b/include/uapi/linux/ethtool_netlink.h
+new file mode 100644
+index 000000000..b8f60545d
+--- /dev/null
++++ b/include/uapi/linux/ethtool_netlink.h
+@@ -0,0 +1,148 @@
++/* SPDX-License-Identifier: GPL-2.0-only WITH Linux-syscall-note */
++/*
++ * include/uapi/linux/ethtool_netlink.h - netlink interface for ethtool
++ *
++ * See Documentation/networking/ethtool-netlink.txt in kernel source tree for
++ * doucumentation of the interface.
++ */
++
++#ifndef _UAPI_LINUX_ETHTOOL_NETLINK_H_
++#define _UAPI_LINUX_ETHTOOL_NETLINK_H_
++
++#include <linux/ethtool.h>
++
++/* message types - userspace to kernel */
++enum {
++	ETHTOOL_MSG_USER_NONE,
++	ETHTOOL_MSG_STRSET_GET,
++	ETHTOOL_MSG_LINKINFO_GET,
++	ETHTOOL_MSG_LINKINFO_SET,
++	ETHTOOL_MSG_LINKMODES_GET,
++	ETHTOOL_MSG_LINKMODES_SET,
++	ETHTOOL_MSG_LINKSTATE_GET,
++
++	/* add new constants above here */
++	__ETHTOOL_MSG_USER_CNT,
++	ETHTOOL_MSG_USER_MAX = __ETHTOOL_MSG_USER_CNT - 1
++};
++
++/* message types - kernel to userspace */
++enum {
++	ETHTOOL_MSG_KERNEL_NONE,
++	ETHTOOL_MSG_STRSET_GET_REPLY,
++	ETHTOOL_MSG_LINKINFO_GET_REPLY,
++	ETHTOOL_MSG_LINKINFO_NTF,
++	ETHTOOL_MSG_LINKMODES_GET_REPLY,
++	ETHTOOL_MSG_LINKMODES_NTF,
++	ETHTOOL_MSG_DEBUG_GET_REPLY,
++	ETHTOOL_MSG_DEBUG_NTF,
++	ETHTOOL_MSG_WOL_GET_REPLY,
++	ETHTOOL_MSG_WOL_NTF,
++	ETHTOOL_MSG_FEATURES_GET_REPLY,
++	ETHTOOL_MSG_FEATURES_SET_REPLY,
++	ETHTOOL_MSG_FEATURES_NTF,
++	ETHTOOL_MSG_PRIVFLAGS_GET_REPLY,
++	ETHTOOL_MSG_PRIVFLAGS_NTF,
++	ETHTOOL_MSG_RINGS_GET_REPLY,
++	ETHTOOL_MSG_RINGS_NTF,
++	ETHTOOL_MSG_CHANNELS_GET_REPLY,
++	ETHTOOL_MSG_CHANNELS_NTF,
++	ETHTOOL_MSG_COALESCE_GET_REPLY,
++	ETHTOOL_MSG_COALESCE_NTF,
++	ETHTOOL_MSG_PAUSE_GET_REPLY,
++	ETHTOOL_MSG_PAUSE_NTF,
++	ETHTOOL_MSG_LINKSTATE_GET_REPLY,
++	ETHTOOL_MSG_EEE_GET_REPLY,
++	ETHTOOL_MSG_EEE_NTF,
++	ETHTOOL_MSG_TSINFO_GET_REPLY,
++	ETHTOOL_MSG_CABLE_TEST_NTF,
++	ETHTOOL_MSG_CABLE_TEST_TDR_NTF,
++
++	/* add new constants above here */
++	__ETHTOOL_MSG_KERNEL_CNT,
++	ETHTOOL_MSG_KERNEL_MAX = __ETHTOOL_MSG_KERNEL_CNT - 1
++};
++
++/* use compact bitsets in reply */
++#define ETHTOOL_FLAG_COMPACT_BITSETS	(1 << 0)
++
++#define ETHTOOL_FLAG_OMIT_REPLY	(1 << 1)
++
++#define ETHTOOL_FLAG_ALL (ETHTOOL_FLAG_COMPACT_BITSETS | \
++		ETHTOOL_FLAG_OMIT_REPLY)
++
++enum {
++	ETHTOOL_A_HEADER_UNSPEC,
++	ETHTOOL_A_HEADER_DEV_INDEX,		/* u32 */
++	ETHTOOL_A_HEADER_DEV_NAME,		/* string */
++	ETHTOOL_A_HEADER_FLAGS,			/* u32 - ETHTOOL_FLAG_* */
++
++	/* add new constants above here */
++	__ETHTOOL_A_HEADER_CNT,
++	ETHTOOL_A_HEADER_MAX = __ETHTOOL_A_HEADER_CNT - 1
++};
++
++/* bit sets */
++
++enum {
++	ETHTOOL_A_BITSET_BIT_UNSPEC,
++	ETHTOOL_A_BITSET_BIT_INDEX,		/* u32 */
++	ETHTOOL_A_BITSET_BIT_NAME,		/* string */
++	ETHTOOL_A_BITSET_BIT_VALUE,		/* flag */
++
++	/* add new constants above here */
++	__ETHTOOL_A_BITSET_BIT_CNT,
++	ETHTOOL_A_BITSET_BIT_MAX = __ETHTOOL_A_BITSET_BIT_CNT - 1
++};
++
++enum {
++	ETHTOOL_A_BITSET_BITS_UNSPEC,
++	ETHTOOL_A_BITSET_BITS_BIT,		/* nest - _A_BITSET_BIT_* */
++
++	/* add new constants above here */
++	__ETHTOOL_A_BITSET_BITS_CNT,
++	ETHTOOL_A_BITSET_BITS_MAX = __ETHTOOL_A_BITSET_BITS_CNT - 1
++};
++
++enum {
++	ETHTOOL_A_BITSET_UNSPEC,
++	ETHTOOL_A_BITSET_NOMASK,		/* flag */
++	ETHTOOL_A_BITSET_SIZE,			/* u32 */
++	ETHTOOL_A_BITSET_BITS,			/* nest - _A_BITSET_BITS_* */
++	ETHTOOL_A_BITSET_VALUE,			/* binary */
++	ETHTOOL_A_BITSET_MASK,			/* binary */
++
++	/* add new constants above here */
++	__ETHTOOL_A_BITSET_CNT,
++	ETHTOOL_A_BITSET_MAX = __ETHTOOL_A_BITSET_CNT - 1
++};
++
++
++/* LINKMODES */
++
++enum {
++	ETHTOOL_A_LINKMODES_UNSPEC,
++	ETHTOOL_A_LINKMODES_HEADER,		/* nest - _A_HEADER_* */
++	ETHTOOL_A_LINKMODES_AUTONEG,		/* u8 */
++	ETHTOOL_A_LINKMODES_OURS,		/* bitset */
++	ETHTOOL_A_LINKMODES_PEER,		/* bitset */
++	ETHTOOL_A_LINKMODES_SPEED,		/* u32 */
++	ETHTOOL_A_LINKMODES_DUPLEX,		/* u8 */
++	ETHTOOL_A_LINKMODES_MASTER_SLAVE_CFG,	/* u8 */
++	ETHTOOL_A_LINKMODES_MASTER_SLAVE_STATE,	/* u8 */
++
++	/* add new constants above here */
++	__ETHTOOL_A_LINKMODES_CNT,
++	ETHTOOL_A_LINKMODES_MAX = __ETHTOOL_A_LINKMODES_CNT - 1
++};
++
++/* generic netlink info */
++#define ETHTOOL_GENL_NAME "ethtool"
++#define ETHTOOL_GENL_VERSION 1
++
++#define ETHTOOL_MCGRP_MONITOR_NAME "monitor"
++
++#define ETHTOOL_LINK_MODE(speed, type, duplex) \
++	ETHTOOL_LINK_MODE_ ## speed ## base ## type ## _ ## duplex ## _BIT
++
++#endif /* _UAPI_LINUX_ETHTOOL_NETLINK_H_ */
+diff --git a/include/uapi/linux/mii.h b/include/uapi/linux/mii.h
+index 51b48e4be..331622d48 100644
+--- a/include/uapi/linux/mii.h
++++ b/include/uapi/linux/mii.h
+@@ -134,11 +134,13 @@
+ /* 1000BASE-T Control register */
+ #define ADVERTISE_1000FULL	0x0200  /* Advertise 1000BASE-T full duplex */
+ #define ADVERTISE_1000HALF	0x0100  /* Advertise 1000BASE-T half duplex */
++#define CTL1000_PREFER_MASTER   0x0400  /* prefer to operate as master */
+ #define CTL1000_AS_MASTER	0x0800
+ #define CTL1000_ENABLE_MASTER	0x1000
+ 
+ /* 1000BASE-T Status register */
+ #define LPA_1000MSFAIL		0x8000	/* Master/Slave resolution failure */
++#define LPA_1000MSRES          0x4000  /* Master/Slave resolution status */
+ #define LPA_1000LOCALRXOK	0x2000	/* Link partner local receiver status */
+ #define LPA_1000REMRXOK		0x1000	/* Link partner remote receiver status */
+ #define LPA_1000FULL		0x0800	/* Link partner 1000BASE-T full duplex */
+diff --git a/net/Kconfig b/net/Kconfig
+index 48ed37cdd..e9f812455 100644
+--- a/net/Kconfig
++++ b/net/Kconfig
+@@ -449,6 +449,14 @@ config FAILOVER
+ 	  migration of VMs with direct attached VFs by failing over to the
+ 	  paravirtual datapath when the VF is unplugged.
+ 
++config ETHTOOL_NETLINK
++	bool "Netlink interface for ethtool"
++	default y
++	help
++	  An alternative userspace interface for ethtool based on generic
++	  netlink. It provides better extensibility and some new features,
++	  e.g. notification messages.
++
+ endif   # if NET
+ 
+ # Used by archs to tell that they support BPF JIT compiler plus which flavour.
+diff --git a/net/Makefile b/net/Makefile
+index 177b6fbac..77417f82c 100644
+--- a/net/Makefile
++++ b/net/Makefile
+@@ -13,7 +13,7 @@ obj-$(CONFIG_NET)		+= $(tmp-y)
+ 
+ # LLC has to be linked before the files in net/802/
+ obj-$(CONFIG_LLC)		+= llc/
+-obj-$(CONFIG_NET)		+= ethernet/ 802/ sched/ netlink/ bpf/
++obj-$(CONFIG_NET)		+= ethernet/ 802/ sched/ netlink/ bpf/ ethtool/
+ obj-$(CONFIG_NETFILTER)		+= netfilter/
+ obj-$(CONFIG_INET)		+= ipv4/
+ obj-$(CONFIG_TLS)		+= tls/
+diff --git a/net/core/ethtool.c b/net/core/ethtool.c
+index 9ae38c3e2..4690a811a 100644
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@ -656,6 +656,8 @@ static int ethtool_get_link_ksettings(struct net_device *dev,
+ 	link_ksettings.base.cmd = ETHTOOL_GLINKSETTINGS;
+ 	link_ksettings.base.link_mode_masks_nwords
+ 		= __ETHTOOL_LINK_MODE_MASK_NU32;
++	link_ksettings.base.master_slave_cfg = MASTER_SLAVE_CFG_UNSUPPORTED;
++	link_ksettings.base.master_slave_state = MASTER_SLAVE_STATE_UNSUPPORTED;
+ 
+ 	return store_link_ksettings_for_user(useraddr, &link_ksettings);
+ }
+@@ -693,6 +695,10 @@ static int ethtool_set_link_ksettings(struct net_device *dev,
+ 	    != link_ksettings.base.link_mode_masks_nwords)
+ 		return -EINVAL;
+ 
++	if (link_ksettings.base.master_slave_cfg ||
++	    link_ksettings.base.master_slave_state)
++		return -EINVAL;
++
+ 	return dev->ethtool_ops->set_link_ksettings(dev, &link_ksettings);
+ }
+ 
+diff --git a/net/ethtool/Makefile b/net/ethtool/Makefile
+new file mode 100644
+index 000000000..d2cf113e4
+--- /dev/null
++++ b/net/ethtool/Makefile
+@@ -0,0 +1,5 @@
++# SPDX-License-Identifier: GPL-2.0-only
++
++obj-$(CONFIG_ETHTOOL_NETLINK)	+= ethtool_nl.o
++
++ethtool_nl-y	:= linkmodes.o bitset.o
+diff --git a/net/ethtool/bitset.c b/net/ethtool/bitset.c
+new file mode 100644
+index 000000000..54b17cbb8
+--- /dev/null
++++ b/net/ethtool/bitset.c
+@@ -0,0 +1,818 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include <linux/ethtool_netlink.h>
++#include <linux/bitmap.h>
++#include "../../include/uapi/linux/ethtool.h"
++#include "../../include/net/netlink.h"
++#include "bitset.h"
++
++static bool ethnl_bitmap32_test_bit(const u32 *map, unsigned int index)
++{
++	return map[index / 32] & (1U << (index % 32));
++}
++
++static u32 ethnl_lower_bits(unsigned int n)
++{
++	return ~(u32)0 >> (32 - n % 32);
++}
++
++static u32 ethnl_upper_bits(unsigned int n)
++{
++	return ~(u32)0 << (n % 32);
++}
++
++static inline int ethnl_strz_size(const char *s)
++{
++	return nla_total_size(strnlen(s, ETH_GSTRING_LEN) + 1);
++}
++
++static inline int ethnl_put_strz(struct sk_buff *skb, u16 attrtype,
++				 const char *s)
++{
++	unsigned int len = strnlen(s, ETH_GSTRING_LEN);
++	struct nlattr *attr;
++
++	attr = nla_reserve(skb, attrtype, len + 1);
++	if (!attr)
++		return -EMSGSIZE;
++
++	memcpy(nla_data(attr), s, len);
++	((char *)nla_data(attr))[len] = '\0';
++	return 0;
++}
++
++/**
++ * ethnl_bitmap32_clear() - Clear u32 based bitmap
++ * @dst:   bitmap to clear
++ * @start: beginning of the interval
++ * @end:   end of the interval
++ * @mod:   set if bitmap was modified
++ *
++ * Clear @nbits bits of a bitmap with indices @start <= i < @end
++ */
++
++static void ethnl_bitmap32_clear(u32 *dst, unsigned int start, unsigned int end,
++				 bool *mod)
++{
++	unsigned int start_word = start / 32;
++	unsigned int end_word = end / 32;
++	unsigned int i;
++	u32 mask;
++
++	if (end <= start)
++		return;
++
++	if (start % 32) {
++		mask = ethnl_upper_bits(start);
++		if (end_word == start_word) {
++			mask &= ethnl_lower_bits(end);
++			if (dst[start_word] & mask) {
++				dst[start_word] &= ~mask;
++				*mod = true;
++			}
++			return;
++		}
++		if (dst[start_word] & mask) {
++			dst[start_word] &= ~mask;
++			*mod = true;
++		}
++		start_word++;
++	}
++
++	for (i = start_word; i < end_word; i++) {
++		if (dst[i]) {
++			dst[i] = 0;
++			*mod = true;
++		}
++	}
++	if (end % 32) {
++		mask = ethnl_lower_bits(end);
++		if (dst[end_word] & mask) {
++			dst[end_word] &= ~mask;
++			*mod = true;
++		}
++	}
++}
++
++/**
++ * ethnl_bitmap32_not_zero() - Check if any bit is set in an interval
++ * @map:   bitmap to test
++ * @start: beginning of the interval
++ * @end:   end of the interval
++ *
++ * Return: true if there is non-zero bit with  index @start <= i < @end,
++ *         false if the whole interval is zero
++ */
++static bool ethnl_bitmap32_not_zero(const u32 *map, unsigned int start,
++				    unsigned int end)
++{
++	unsigned int start_word = start / 32;
++	unsigned int end_word = end / 32;
++	u32 mask;
++
++	if (end <= start)
++		return true;
++
++	if (start % 32) {
++		mask = ethnl_upper_bits(start);
++		if (end_word == start_word) {
++			mask &= ethnl_lower_bits(end);
++			return map[start_word] & mask;
++		}
++		if (map[start_word] & mask)
++			return true;
++		start_word++;
++	}
++
++	if (!memchr_inv(map + start_word, '\0',
++			(end_word - start_word) * sizeof(u32)))
++		return true;
++	if (end % 32 == 0)
++		return true;
++	return map[end_word] & ethnl_lower_bits(end);
++}
++
++/**
++ * ethnl_bitmap32_update() - Modify u32 based bitmap according to value/mask
++ *			     pair
++ * @dst:   bitmap to update
++ * @nbits: bit size of the bitmap
++ * @value: values to set
++ * @mask:  mask of bits to set
++ * @mod:   set to true if bitmap is modified, preserve if not
++ *
++ * Set bits in @dst bitmap which are set in @mask to values from @value, leave
++ * the rest untouched. If destination bitmap was modified, set @mod to true,
++ * leave as it is if not.
++ */
++static void ethnl_bitmap32_update(u32 *dst, unsigned int nbits,
++				  const u32 *value, const u32 *mask, bool *mod)
++{
++	while (nbits > 0) {
++		u32 real_mask = mask ? *mask : ~(u32)0;
++		u32 new_value;
++
++		if (nbits < 32)
++			real_mask &= ethnl_lower_bits(nbits);
++		new_value = (*dst & ~real_mask) | (*value & real_mask);
++		if (new_value != *dst) {
++			*dst = new_value;
++			*mod = true;
++		}
++
++		if (nbits <= 32)
++			break;
++		dst++;
++		nbits -= 32;
++		value++;
++		if (mask)
++			mask++;
++	}
++}
++
++/**
++ * ethnl_bitset32_size() - Calculate size of bitset nested attribute
++ * @val:     value bitmap (u32 based)
++ * @mask:    mask bitmap (u32 based, optional)
++ * @nbits:   bit length of the bitset
++ * @names:   array of bit names (optional)
++ * @compact: assume compact format for output
++ *
++ * Estimate length of netlink attribute composed by a later call to
++ * ethnl_put_bitset32() call with the same arguments.
++ *
++ * Return: negative error code or attribute length estimate
++ */
++
++int ethnl_bitset32_size(const u32 *val, const u32 *mask, unsigned int nbits,
++			ethnl_string_array_t names, bool compact)
++{
++	unsigned int len = 0;
++
++	/* list flag */
++	if (!mask)
++		len += nla_total_size(sizeof(u32));
++	/* size */
++	len += nla_total_size(sizeof(u32));
++
++	if (compact) {
++		unsigned int nwords = DIV_ROUND_UP(nbits, 32);
++
++		/* value, mask */
++		len += (mask ? 2 : 1) * nla_total_size(nwords * sizeof(u32));
++	} else {
++		unsigned int bits_len = 0;
++		unsigned int bit_len, i;
++
++		for (i = 0; i < nbits; i++) {
++			const char *name = names ? names[i] : NULL;
++
++			if (!ethnl_bitmap32_test_bit(mask ?: val, i))
++				continue;
++			/* index */
++			bit_len = nla_total_size(sizeof(u32));
++			/* name */
++			if (name)
++				bit_len += ethnl_strz_size(name);
++			/* value */
++			if (mask && ethnl_bitmap32_test_bit(val, i))
++				bit_len += nla_total_size(0);
++
++			/* bit nest */
++			bits_len += nla_total_size(bit_len);
++		}
++		/* bits nest */
++		len += nla_total_size(bits_len);
++	}
++
++	/* outermost nest */
++	return nla_total_size(len);
++}
++
++/**
++ * ethnl_put_bitset32() - Put a bitset nest into a message
++ * @skb:      skb with the message
++ * @attrtype: attribute type for the bitset nest
++ * @val:      value bitmap (u32 based)
++ * @mask:     mask bitmap (u32 based, optional)
++ * @nbits:    bit length of the bitset
++ * @names:    array of bit names (optional)
++ * @compact:  use compact format for the output
++ *
++ * Compose a nested attribute representing a bitset. If @mask is null, simple
++ * bitmap (bit list) is created, if @mask is provided, represent a value/mask
++ * pair. Bit names are only used in verbose mode and when provided by calller.
++ *
++ * Return: 0 on success, negative error value on error
++ */
++int ethnl_put_bitset32(struct sk_buff *skb, int attrtype, const u32 *val,
++		       const u32 *mask, unsigned int nbits,
++		       ethnl_string_array_t names, bool compact)
++{
++	struct nlattr *nest;
++	struct nlattr *attr;
++
++	nest = nla_nest_start(skb, attrtype);
++	if (!nest)
++		return -EMSGSIZE;
++
++	if (!mask && nla_put_flag(skb, ETHTOOL_A_BITSET_NOMASK))
++		goto nla_put_failure;
++	if (nla_put_u32(skb, ETHTOOL_A_BITSET_SIZE, nbits))
++		goto nla_put_failure;
++	if (compact) {
++		unsigned int nwords = DIV_ROUND_UP(nbits, 32);
++		unsigned int nbytes = nwords * sizeof(u32);
++		u32 *dst;
++
++		attr = nla_reserve(skb, ETHTOOL_A_BITSET_VALUE, nbytes);
++		if (!attr)
++			goto nla_put_failure;
++		dst = nla_data(attr);
++		memcpy(dst, val, nbytes);
++		if (nbits % 32)
++			dst[nwords - 1] &= ethnl_lower_bits(nbits);
++
++		if (mask) {
++			attr = nla_reserve(skb, ETHTOOL_A_BITSET_MASK, nbytes);
++			if (!attr)
++				goto nla_put_failure;
++			dst = nla_data(attr);
++			memcpy(dst, mask, nbytes);
++			if (nbits % 32)
++				dst[nwords - 1] &= ethnl_lower_bits(nbits);
++		}
++	} else {
++		struct nlattr *bits;
++		unsigned int i;
++
++		bits = nla_nest_start(skb, ETHTOOL_A_BITSET_BITS);
++		if (!bits)
++			goto nla_put_failure;
++		for (i = 0; i < nbits; i++) {
++			const char *name = names ? names[i] : NULL;
++
++			if (!ethnl_bitmap32_test_bit(mask ?: val, i))
++				continue;
++			attr = nla_nest_start(skb, ETHTOOL_A_BITSET_BITS_BIT);
++			if (!attr)
++				goto nla_put_failure;
++			if (nla_put_u32(skb, ETHTOOL_A_BITSET_BIT_INDEX, i))
++				goto nla_put_failure;
++			if (name &&
++			    ethnl_put_strz(skb, ETHTOOL_A_BITSET_BIT_NAME, name))
++				goto nla_put_failure;
++			if (mask && ethnl_bitmap32_test_bit(val, i) &&
++			    nla_put_flag(skb, ETHTOOL_A_BITSET_BIT_VALUE))
++				goto nla_put_failure;
++			nla_nest_end(skb, attr);
++		}
++		nla_nest_end(skb, bits);
++	}
++
++	nla_nest_end(skb, nest);
++	return 0;
++
++nla_put_failure:
++	nla_nest_cancel(skb, nest);
++	return -EMSGSIZE;
++}
++
++static const struct nla_policy bitset_policy[ETHTOOL_A_BITSET_MAX + 1] = {
++	[ETHTOOL_A_BITSET_UNSPEC]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_BITSET_NOMASK]	= { .type = NLA_FLAG },
++	[ETHTOOL_A_BITSET_SIZE]		= NLA_POLICY_MAX(NLA_U32,
++							 ETHNL_MAX_BITSET_SIZE),
++	[ETHTOOL_A_BITSET_BITS]		= { .type = NLA_NESTED },
++	[ETHTOOL_A_BITSET_VALUE]	= { .type = NLA_BINARY },
++	[ETHTOOL_A_BITSET_MASK]		= { .type = NLA_BINARY },
++};
++
++static const struct nla_policy bit_policy[ETHTOOL_A_BITSET_BIT_MAX + 1] = {
++	[ETHTOOL_A_BITSET_BIT_UNSPEC]	= { .type = NLA_REJECT },
++	[ETHTOOL_A_BITSET_BIT_INDEX]	= { .type = NLA_U32 },
++	[ETHTOOL_A_BITSET_BIT_NAME]	= { .type = NLA_NUL_STRING },
++	[ETHTOOL_A_BITSET_BIT_VALUE]	= { .type = NLA_FLAG },
++};
++
++/**
++ * ethnl_name_to_idx() - look up string index for a name
++ * @names:   array of ETH_GSTRING_LEN sized strings
++ * @n_names: number of strings in the array
++ * @name:    name to look up
++ *
++ * Return: index of the string if found, -ENOENT if not found
++ */
++static int ethnl_name_to_idx(ethnl_string_array_t names, unsigned int n_names,
++			     const char *name)
++{
++	unsigned int i;
++
++	if (!names)
++		return -ENOENT;
++
++	for (i = 0; i < n_names; i++) {
++		/* names[i] may not be null terminated */
++		if (!strncmp(names[i], name, ETH_GSTRING_LEN) &&
++		    strlen(name) <= ETH_GSTRING_LEN)
++			return i;
++	}
++
++	return -ENOENT;
++}
++
++static int ethnl_parse_bit(unsigned int *index, bool *val, unsigned int nbits,
++			   const struct nlattr *bit_attr, bool no_mask,
++			   ethnl_string_array_t names,
++			   struct netlink_ext_ack *extack)
++{
++	struct nlattr *tb[ETHTOOL_A_BITSET_BIT_MAX + 1];
++	int ret, idx;
++
++	ret = nla_parse_nested(tb, ETHTOOL_A_BITSET_BIT_MAX, bit_attr,
++			       bit_policy, extack);
++	if (ret < 0)
++		return ret;
++
++	if (tb[ETHTOOL_A_BITSET_BIT_INDEX]) {
++		const char *name;
++
++		idx = nla_get_u32(tb[ETHTOOL_A_BITSET_BIT_INDEX]);
++		if (idx >= nbits) {
++			NL_SET_ERR_MSG_ATTR(extack,
++					    tb[ETHTOOL_A_BITSET_BIT_INDEX],
++					    "bit index too high");
++			return -EOPNOTSUPP;
++		}
++		name = names ? names[idx] : NULL;
++		if (tb[ETHTOOL_A_BITSET_BIT_NAME] && name &&
++		    strncmp(nla_data(tb[ETHTOOL_A_BITSET_BIT_NAME]), name,
++			    nla_len(tb[ETHTOOL_A_BITSET_BIT_NAME]))) {
++			NL_SET_ERR_MSG_ATTR(extack, bit_attr,
++					    "bit index and name mismatch");
++			return -EINVAL;
++		}
++	} else if (tb[ETHTOOL_A_BITSET_BIT_NAME]) {
++		idx = ethnl_name_to_idx(names, nbits,
++					nla_data(tb[ETHTOOL_A_BITSET_BIT_NAME]));
++		if (idx < 0) {
++			NL_SET_ERR_MSG_ATTR(extack,
++					    tb[ETHTOOL_A_BITSET_BIT_NAME],
++					    "bit name not found");
++			return -EOPNOTSUPP;
++		}
++	} else {
++		NL_SET_ERR_MSG_ATTR(extack, bit_attr,
++				    "neither bit index nor name specified");
++		return -EINVAL;
++	}
++
++	*index = idx;
++	*val = no_mask || tb[ETHTOOL_A_BITSET_BIT_VALUE];
++	return 0;
++}
++
++static int
++ethnl_update_bitset32_verbose(u32 *bitmap, unsigned int nbits,
++			      const struct nlattr *attr, struct nlattr **tb,
++			      ethnl_string_array_t names,
++			      struct netlink_ext_ack *extack, bool *mod)
++{
++	struct nlattr *bit_attr;
++	bool no_mask;
++	int rem;
++	int ret;
++
++	if (tb[ETHTOOL_A_BITSET_VALUE]) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_VALUE],
++				    "value only allowed in compact bitset");
++		return -EINVAL;
++	}
++	if (tb[ETHTOOL_A_BITSET_MASK]) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_MASK],
++				    "mask only allowed in compact bitset");
++		return -EINVAL;
++	}
++
++	no_mask = tb[ETHTOOL_A_BITSET_NOMASK];
++	if (no_mask)
++		ethnl_bitmap32_clear(bitmap, 0, nbits, mod);
++
++	nla_for_each_nested(bit_attr, tb[ETHTOOL_A_BITSET_BITS], rem) {
++		bool old_val, new_val;
++		unsigned int idx;
++
++		if (nla_type(bit_attr) != ETHTOOL_A_BITSET_BITS_BIT) {
++			NL_SET_ERR_MSG_ATTR(extack, bit_attr,
++					    "only ETHTOOL_A_BITSET_BITS_BIT allowed in ETHTOOL_A_BITSET_BITS");
++			return -EINVAL;
++		}
++		ret = ethnl_parse_bit(&idx, &new_val, nbits, bit_attr, no_mask,
++				      names, extack);
++		if (ret < 0)
++			return ret;
++		old_val = bitmap[idx / 32] & ((u32)1 << (idx % 32));
++		if (new_val != old_val) {
++			if (new_val)
++				bitmap[idx / 32] |= ((u32)1 << (idx % 32));
++			else
++				bitmap[idx / 32] &= ~((u32)1 << (idx % 32));
++			*mod = true;
++		}
++	}
++
++	return 0;
++}
++
++static int ethnl_compact_sanity_checks(unsigned int nbits,
++				       const struct nlattr *nest,
++				       struct nlattr **tb,
++				       struct netlink_ext_ack *extack)
++{
++	bool no_mask = tb[ETHTOOL_A_BITSET_NOMASK];
++	unsigned int attr_nbits, attr_nwords;
++	const struct nlattr *test_attr;
++
++	if (no_mask && tb[ETHTOOL_A_BITSET_MASK]) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_MASK],
++				    "mask not allowed in list bitset");
++		return -EINVAL;
++	}
++	if (!tb[ETHTOOL_A_BITSET_SIZE]) {
++		NL_SET_ERR_MSG_ATTR(extack, nest,
++				    "missing size in compact bitset");
++		return -EINVAL;
++	}
++	if (!tb[ETHTOOL_A_BITSET_VALUE]) {
++		NL_SET_ERR_MSG_ATTR(extack, nest,
++				    "missing value in compact bitset");
++		return -EINVAL;
++	}
++	if (!no_mask && !tb[ETHTOOL_A_BITSET_MASK]) {
++		NL_SET_ERR_MSG_ATTR(extack, nest,
++				    "missing mask in compact nonlist bitset");
++		return -EINVAL;
++	}
++
++	attr_nbits = nla_get_u32(tb[ETHTOOL_A_BITSET_SIZE]);
++	attr_nwords = DIV_ROUND_UP(attr_nbits, 32);
++	if (nla_len(tb[ETHTOOL_A_BITSET_VALUE]) != attr_nwords * sizeof(u32)) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_VALUE],
++				    "bitset value length does not match size");
++		return -EINVAL;
++	}
++	if (tb[ETHTOOL_A_BITSET_MASK] &&
++	    nla_len(tb[ETHTOOL_A_BITSET_MASK]) != attr_nwords * sizeof(u32)) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_MASK],
++				    "bitset mask length does not match size");
++		return -EINVAL;
++	}
++	if (attr_nbits <= nbits)
++		return 0;
++
++	test_attr = no_mask ? tb[ETHTOOL_A_BITSET_VALUE] :
++			      tb[ETHTOOL_A_BITSET_MASK];
++	if (ethnl_bitmap32_not_zero(nla_data(test_attr), nbits, attr_nbits)) {
++		NL_SET_ERR_MSG_ATTR(extack, test_attr,
++				    "cannot modify bits past kernel bitset size");
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/**
++ * ethnl_update_bitset32() - Apply a bitset nest to a u32 based bitmap
++ * @bitmap:  bitmap to update
++ * @nbits:   size of the updated bitmap in bits
++ * @attr:    nest attribute to parse and apply
++ * @names:   array of bit names; may be null for compact format
++ * @extack:  extack for error reporting
++ * @mod:     set this to true if bitmap is modified, leave as it is if not
++ *
++ * Apply bitset netsted attribute to a bitmap. If the attribute represents
++ * a bit list, @bitmap is set to its contents; otherwise, bits in mask are
++ * set to values from value. Bitmaps in the attribute may be longer than
++ * @nbits but the message must not request modifying any bits past @nbits.
++ *
++ * Return: negative error code on failure, 0 on success
++ */
++int ethnl_update_bitset32(u32 *bitmap, unsigned int nbits,
++			  const struct nlattr *attr, ethnl_string_array_t names,
++			  struct netlink_ext_ack *extack, bool *mod)
++{
++	struct nlattr *tb[ETHTOOL_A_BITSET_MAX + 1];
++	unsigned int change_bits;
++	bool no_mask;
++	int ret;
++
++	if (!attr)
++		return 0;
++	ret = nla_parse_nested(tb, ETHTOOL_A_BITSET_MAX, attr, bitset_policy,
++			       extack);
++	if (ret < 0)
++		return ret;
++
++	if (tb[ETHTOOL_A_BITSET_BITS])
++		return ethnl_update_bitset32_verbose(bitmap, nbits, attr, tb,
++						     names, extack, mod);
++	ret = ethnl_compact_sanity_checks(nbits, attr, tb, extack);
++	if (ret < 0)
++		return ret;
++
++	no_mask = tb[ETHTOOL_A_BITSET_NOMASK];
++	change_bits = min_t(unsigned int,
++			    nla_get_u32(tb[ETHTOOL_A_BITSET_SIZE]), nbits);
++	ethnl_bitmap32_update(bitmap, change_bits,
++			      nla_data(tb[ETHTOOL_A_BITSET_VALUE]),
++			      no_mask ? NULL :
++					nla_data(tb[ETHTOOL_A_BITSET_MASK]),
++			      mod);
++	if (no_mask && change_bits < nbits)
++		ethnl_bitmap32_clear(bitmap, change_bits, nbits, mod);
++
++	return 0;
++}
++
++/**
++ * ethnl_parse_bitset() - Compute effective value and mask from bitset nest
++ * @val:     unsigned long based bitmap to put value into
++ * @mask:    unsigned long based bitmap to put mask into
++ * @nbits:   size of @val and @mask bitmaps
++ * @attr:    nest attribute to parse and apply
++ * @names:   array of bit names; may be null for compact format
++ * @extack:  extack for error reporting
++ *
++ * Provide @nbits size long bitmaps for value and mask so that
++ * x = (val & mask) | (x & ~mask) would modify any @nbits sized bitmap x
++ * the same way ethnl_update_bitset() with the same bitset attribute would.
++ *
++ * Return:   negative error code on failure, 0 on success
++ */
++int ethnl_parse_bitset(unsigned long *val, unsigned long *mask,
++		       unsigned int nbits, const struct nlattr *attr,
++		       ethnl_string_array_t names,
++		       struct netlink_ext_ack *extack)
++{
++	struct nlattr *tb[ETHTOOL_A_BITSET_MAX + 1];
++	const struct nlattr *bit_attr;
++	bool no_mask;
++	int rem;
++	int ret;
++
++	if (!attr)
++		return 0;
++	ret = nla_parse_nested(tb, ETHTOOL_A_BITSET_MAX, attr, bitset_policy,
++			       extack);
++	if (ret < 0)
++		return ret;
++	no_mask = tb[ETHTOOL_A_BITSET_NOMASK];
++
++	if (!tb[ETHTOOL_A_BITSET_BITS]) {
++		unsigned int change_bits;
++
++		ret = ethnl_compact_sanity_checks(nbits, attr, tb, extack);
++		if (ret < 0)
++			return ret;
++
++		change_bits = nla_get_u32(tb[ETHTOOL_A_BITSET_SIZE]);
++		bitmap_from_arr32(val, nla_data(tb[ETHTOOL_A_BITSET_VALUE]),
++				  change_bits);
++		if (change_bits < nbits)
++			bitmap_clear(val, change_bits, nbits - change_bits);
++		if (no_mask) {
++			bitmap_fill(mask, nbits);
++		} else {
++			bitmap_from_arr32(mask,
++					  nla_data(tb[ETHTOOL_A_BITSET_MASK]),
++					  change_bits);
++			if (change_bits < nbits)
++				bitmap_clear(mask, change_bits,
++					     nbits - change_bits);
++		}
++
++		return 0;
++	}
++
++	if (tb[ETHTOOL_A_BITSET_VALUE]) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_VALUE],
++				    "value only allowed in compact bitset");
++		return -EINVAL;
++	}
++	if (tb[ETHTOOL_A_BITSET_MASK]) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_BITSET_MASK],
++				    "mask only allowed in compact bitset");
++		return -EINVAL;
++	}
++
++	bitmap_zero(val, nbits);
++	if (no_mask)
++		bitmap_fill(mask, nbits);
++	else
++		bitmap_zero(mask, nbits);
++
++	nla_for_each_nested(bit_attr, tb[ETHTOOL_A_BITSET_BITS], rem) {
++		unsigned int idx;
++		bool bit_val;
++
++		ret = ethnl_parse_bit(&idx, &bit_val, nbits, bit_attr, no_mask,
++				      names, extack);
++		if (ret < 0)
++			return ret;
++		if (bit_val)
++			__set_bit(idx, val);
++		if (!no_mask)
++			__set_bit(idx, mask);
++	}
++
++	return 0;
++}
++
++#if BITS_PER_LONG == 64 && defined(__BIG_ENDIAN)
++
++/* 64-bit big endian architectures are the only case when u32 based bitmaps
++ * and unsigned long based bitmaps have different memory layout so that we
++ * cannot simply cast the latter to the former and need actual wrappers
++ * converting the latter to the former.
++ *
++ * To reduce the number of slab allocations, the wrappers use fixed size local
++ * variables for bitmaps up to ETHNL_SMALL_BITMAP_BITS bits which is the
++ * majority of bitmaps used by ethtool.
++ */
++#define ETHNL_SMALL_BITMAP_BITS 128
++#define ETHNL_SMALL_BITMAP_WORDS DIV_ROUND_UP(ETHNL_SMALL_BITMAP_BITS, 32)
++
++int ethnl_bitset_size(const unsigned long *val, const unsigned long *mask,
++		      unsigned int nbits, ethnl_string_array_t names,
++		      bool compact)
++{
++	u32 small_mask32[ETHNL_SMALL_BITMAP_WORDS];
++	u32 small_val32[ETHNL_SMALL_BITMAP_WORDS];
++	u32 *mask32;
++	u32 *val32;
++	int ret;
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS) {
++		unsigned int nwords = DIV_ROUND_UP(nbits, 32);
++
++		val32 = kmalloc_array(2 * nwords, sizeof(u32), GFP_KERNEL);
++		if (!val32)
++			return -ENOMEM;
++		mask32 = val32 + nwords;
++	} else {
++		val32 = small_val32;
++		mask32 = small_mask32;
++	}
++
++	bitmap_to_arr32(val32, val, nbits);
++	if (mask)
++		bitmap_to_arr32(mask32, mask, nbits);
++	else
++		mask32 = NULL;
++	ret = ethnl_bitset32_size(val32, mask32, nbits, names, compact);
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS)
++		kfree(val32);
++
++	return ret;
++}
++
++int ethnl_put_bitset(struct sk_buff *skb, int attrtype,
++		     const unsigned long *val, const unsigned long *mask,
++		     unsigned int nbits, ethnl_string_array_t names,
++		     bool compact)
++{
++	u32 small_mask32[ETHNL_SMALL_BITMAP_WORDS];
++	u32 small_val32[ETHNL_SMALL_BITMAP_WORDS];
++	u32 *mask32;
++	u32 *val32;
++	int ret;
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS) {
++		unsigned int nwords = DIV_ROUND_UP(nbits, 32);
++
++		val32 = kmalloc_array(2 * nwords, sizeof(u32), GFP_KERNEL);
++		if (!val32)
++			return -ENOMEM;
++		mask32 = val32 + nwords;
++	} else {
++		val32 = small_val32;
++		mask32 = small_mask32;
++	}
++
++	bitmap_to_arr32(val32, val, nbits);
++	if (mask)
++		bitmap_to_arr32(mask32, mask, nbits);
++	else
++		mask32 = NULL;
++	ret = ethnl_put_bitset32(skb, attrtype, val32, mask32, nbits, names,
++				 compact);
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS)
++		kfree(val32);
++
++	return ret;
++}
++
++int ethnl_update_bitset(unsigned long *bitmap, unsigned int nbits,
++			const struct nlattr *attr, ethnl_string_array_t names,
++			struct netlink_ext_ack *extack, bool *mod)
++{
++	u32 small_bitmap32[ETHNL_SMALL_BITMAP_WORDS];
++	u32 *bitmap32 = small_bitmap32;
++	bool u32_mod = false;
++	int ret;
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS) {
++		unsigned int dst_words = DIV_ROUND_UP(nbits, 32);
++
++		bitmap32 = kmalloc_array(dst_words, sizeof(u32), GFP_KERNEL);
++		if (!bitmap32)
++			return -ENOMEM;
++	}
++
++	bitmap_to_arr32(bitmap32, bitmap, nbits);
++	ret = ethnl_update_bitset32(bitmap32, nbits, attr, names, extack,
++				    &u32_mod);
++	if (u32_mod) {
++		bitmap_from_arr32(bitmap, bitmap32, nbits);
++		*mod = true;
++	}
++
++	if (nbits > ETHNL_SMALL_BITMAP_BITS)
++		kfree(bitmap32);
++
++	return ret;
++}
++
++#else
++
++/* On little endian 64-bit and all 32-bit architectures, an unsigned long
++ * based bitmap can be interpreted as u32 based one using a simple cast.
++ */
++
++int ethnl_bitset_size(const unsigned long *val, const unsigned long *mask,
++		      unsigned int nbits, ethnl_string_array_t names,
++		      bool compact)
++{
++	return ethnl_bitset32_size((const u32 *)val, (const u32 *)mask, nbits,
++				   names, compact);
++}
++
++int ethnl_put_bitset(struct sk_buff *skb, int attrtype,
++		     const unsigned long *val, const unsigned long *mask,
++		     unsigned int nbits, ethnl_string_array_t names,
++		     bool compact)
++{
++	return ethnl_put_bitset32(skb, attrtype, (const u32 *)val,
++				  (const u32 *)mask, nbits, names, compact);
++}
++
++int ethnl_update_bitset(unsigned long *bitmap, unsigned int nbits,
++			const struct nlattr *attr, ethnl_string_array_t names,
++			struct netlink_ext_ack *extack, bool *mod)
++{
++	return ethnl_update_bitset32((u32 *)bitmap, nbits, attr, names, extack,
++				     mod);
++}
++
++#endif /* BITS_PER_LONG == 64 && defined(__BIG_ENDIAN) */
+diff --git a/net/ethtool/bitset.h b/net/ethtool/bitset.h
+new file mode 100644
+index 000000000..05a76fc10
+--- /dev/null
++++ b/net/ethtool/bitset.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++
++#ifndef _NET_ETHTOOL_BITSET_H
++#define _NET_ETHTOOL_BITSET_H
++
++#define ETHNL_MAX_BITSET_SIZE S16_MAX
++
++typedef const char (*const ethnl_string_array_t)[ETH_GSTRING_LEN];
++
++int ethnl_bitset_is_compact(const struct nlattr *bitset, bool *compact);
++int ethnl_bitset_size(const unsigned long *val, const unsigned long *mask,
++		      unsigned int nbits, ethnl_string_array_t names,
++		      bool compact);
++int ethnl_bitset32_size(const u32 *val, const u32 *mask, unsigned int nbits,
++			ethnl_string_array_t names, bool compact);
++int ethnl_put_bitset(struct sk_buff *skb, int attrtype,
++		     const unsigned long *val, const unsigned long *mask,
++		     unsigned int nbits, ethnl_string_array_t names,
++		     bool compact);
++int ethnl_put_bitset32(struct sk_buff *skb, int attrtype, const u32 *val,
++		       const u32 *mask, unsigned int nbits,
++		       ethnl_string_array_t names, bool compact);
++int ethnl_update_bitset(unsigned long *bitmap, unsigned int nbits,
++			const struct nlattr *attr, ethnl_string_array_t names,
++			struct netlink_ext_ack *extack, bool *mod);
++int ethnl_update_bitset32(u32 *bitmap, unsigned int nbits,
++			  const struct nlattr *attr, ethnl_string_array_t names,
++			  struct netlink_ext_ack *extack, bool *mod);
++int ethnl_parse_bitset(unsigned long *val, unsigned long *mask,
++		       unsigned int nbits, const struct nlattr *attr,
++		       ethnl_string_array_t names,
++		       struct netlink_ext_ack *extack);
++
++#endif /* _NET_ETHTOOL_BITSET_H */
++
++int ethnl_set_linkmodes(struct sk_buff *skb, struct genl_info *info);
++
++int ethnl_fill_reply_header(struct sk_buff *skb, struct net_device *dev,
++			    u16 attrtype);
++
++int ethnl_multicast(struct sk_buff *skb, struct net_device *dev);
+diff --git a/net/ethtool/linkmodes.c b/net/ethtool/linkmodes.c
+new file mode 100644
+index 000000000..c92ac0a1f
+--- /dev/null
++++ b/net/ethtool/linkmodes.c
+@@ -0,0 +1,814 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#include "../../include/linux/ethtool.h"
++#include "../../include/uapi/linux/ethtool_netlink.h"
++#include "../../include/net/netlink.h"
++#include "../../include/linux/netdevice.h"
++#include "../../include/linux/ethtool_netlink.h"
++#include "../../include/net/genetlink.h"
++#include "../../include/linux/rtnetlink.h"
++#include "bitset.h"
++
++#define	ALTIFNAMSIZ	128
++#define __LINK_MODE_NAME(speed, type, duplex) \
++	#speed "base" #type "/" #duplex
++#define __DEFINE_LINK_MODE_NAME(speed, type, duplex) \
++	[ETHTOOL_LINK_MODE(speed, type, duplex)] = \
++	__LINK_MODE_NAME(speed, type, duplex)
++#define __DEFINE_SPECIAL_MODE_NAME(_mode, _name) \
++	[ETHTOOL_LINK_MODE_ ## _mode ## _BIT] = _name
++
++#define ETHTOOL_LINK_MODE(speed, type, duplex) \
++	ETHTOOL_LINK_MODE_ ## speed ## base ## type ## _ ## duplex ## _BIT
++
++#define __DEFINE_LINK_MODE_PARAMS(_speed, _type, _duplex) \
++	[ETHTOOL_LINK_MODE(_speed, _type, _duplex)] = { \
++		.speed  = SPEED_ ## _speed, \
++		.duplex = __DUPLEX_ ## _duplex \
++				}
++#define __DUPLEX_Half DUPLEX_HALF
++#define __DUPLEX_Full DUPLEX_FULL
++#define __DEFINE_SPECIAL_MODE_PARAMS(_mode) \
++	[ETHTOOL_LINK_MODE_ ## _mode ## _BIT] = { \
++		.speed  = SPEED_UNKNOWN, \
++		.duplex = DUPLEX_UNKNOWN, \
++	}
++
++struct ethnl_req_info {
++	struct net_device	*dev;
++	u32			flags;
++};
++
++struct linkinfo_req_info {
++	struct ethnl_req_info		base;
++};
++
++static struct genl_family ethtool_genl_family;
++
++static bool ethnl_ok __read_mostly;
++static u32 ethnl_bcast_seq;
++
++static const struct genl_multicast_group ethtool_nl_mcgrps[] = {
++	[ETHNL_MCGRP_MONITOR] = { .name = ETHTOOL_MCGRP_MONITOR_NAME },
++};
++
++struct linkmodes_req_info {
++	struct ethnl_req_info           base;
++};
++
++struct ethnl_reply_data {
++	struct net_device               *dev;
++};
++
++struct linkmodes_reply_data {
++	struct ethnl_reply_data         base;
++	struct ethtool_link_ksettings   ksettings;
++	struct ethtool_link_settings    *lsettings;
++	bool                            peer_empty;
++};
++
++typedef void (*ethnl_notify_handler_t)(struct net_device *dev, unsigned int cmd,
++		const void *data);
++
++struct link_mode_info {
++	int                             speed;
++	u8                              duplex;
++};
++
++#define LINKMODES_REPDATA(__reply_base) \
++	container_of(__reply_base, struct linkmodes_reply_data, base)
++
++struct ethnl_request_ops {
++	u8                      request_cmd;
++	u8                      reply_cmd;
++	u16                     hdr_attr;
++	unsigned int            max_attr;
++	unsigned int            req_info_size;
++	unsigned int            reply_data_size;
++	const struct nla_policy *request_policy;
++	bool                    allow_nodev_do;
++
++	int (*parse_request)(struct ethnl_req_info *req_info,
++			     struct nlattr **tb,
++			struct netlink_ext_ack *extack);
++	int (*prepare_data)(const struct ethnl_req_info *req_info,
++			    struct ethnl_reply_data *reply_data,
++			    struct genl_info *info);
++	int (*reply_size)(const struct ethnl_req_info *req_info,
++			  const struct ethnl_reply_data *reply_data);
++	int (*fill_reply)(struct sk_buff *skb,
++			  const struct ethnl_req_info *req_info,
++			  const struct ethnl_reply_data *reply_data);
++	void (*cleanup_data)(struct ethnl_reply_data *reply_data);
++};
++
++static const struct nla_policy ethnl_header_policy[ETHTOOL_A_HEADER_MAX + 1] = {
++	[ETHTOOL_A_HEADER_UNSPEC]       = { .type = NLA_REJECT },
++	[ETHTOOL_A_HEADER_DEV_INDEX]    = { .type = NLA_U32 },
++	[ETHTOOL_A_HEADER_DEV_NAME]     = { .type = NLA_NUL_STRING,
++		.len = ALTIFNAMSIZ - 1 },
++	[ETHTOOL_A_HEADER_FLAGS]        = { .type = NLA_U32 },
++};
++
++static struct genl_family ethtool_genl_family = {
++	.name           = ETHTOOL_GENL_NAME,
++	.version        = ETHTOOL_GENL_VERSION,
++	.netnsok        = true,
++	.parallel_ops   = true,
++	.mcgrps         = ethtool_nl_mcgrps,
++	.n_mcgrps       = ARRAY_SIZE(ethtool_nl_mcgrps),
++};
++
++static const struct nla_policy
++linkmodes_get_policy[ETHTOOL_A_LINKMODES_MAX + 1] = {
++	[ETHTOOL_A_LINKMODES_UNSPEC]            = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_HEADER]            = { .type = NLA_NESTED },
++	[ETHTOOL_A_LINKMODES_AUTONEG]           = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_OURS]              = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_PEER]              = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_SPEED]             = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_DUPLEX]            = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_MASTER_SLAVE_CFG]  = { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_MASTER_SLAVE_STATE]    = { .type = NLA_REJECT },
++};
++
++const char link_mode_names[][ETH_GSTRING_LEN] = {
++	__DEFINE_LINK_MODE_NAME(10, T, Half),
++	__DEFINE_LINK_MODE_NAME(10, T, Full),
++	__DEFINE_LINK_MODE_NAME(100, T, Half),
++	__DEFINE_LINK_MODE_NAME(100, T, Full),
++	__DEFINE_LINK_MODE_NAME(1000, T, Half),
++	__DEFINE_LINK_MODE_NAME(1000, T, Full),
++	__DEFINE_SPECIAL_MODE_NAME(Autoneg, "Autoneg"),
++	__DEFINE_SPECIAL_MODE_NAME(TP, "TP"),
++	__DEFINE_SPECIAL_MODE_NAME(AUI, "AUI"),
++	__DEFINE_SPECIAL_MODE_NAME(MII, "MII"),
++	__DEFINE_SPECIAL_MODE_NAME(FIBRE, "FIBRE"),
++	__DEFINE_SPECIAL_MODE_NAME(BNC, "BNC"),
++	__DEFINE_LINK_MODE_NAME(10000, T, Full),
++	__DEFINE_SPECIAL_MODE_NAME(Pause, "Pause"),
++	__DEFINE_SPECIAL_MODE_NAME(Asym_Pause, "Asym_Pause"),
++	__DEFINE_LINK_MODE_NAME(2500, X, Full),
++	__DEFINE_SPECIAL_MODE_NAME(Backplane, "Backplane"),
++	__DEFINE_LINK_MODE_NAME(1000, KX, Full),
++	__DEFINE_LINK_MODE_NAME(10000, KX4, Full),
++	__DEFINE_LINK_MODE_NAME(10000, KR, Full),
++	__DEFINE_SPECIAL_MODE_NAME(10000baseR_FEC, "10000baseR_FEC"),
++	__DEFINE_LINK_MODE_NAME(20000, MLD2, Full),
++	__DEFINE_LINK_MODE_NAME(20000, KR2, Full),
++	__DEFINE_LINK_MODE_NAME(40000, KR4, Full),
++	__DEFINE_LINK_MODE_NAME(40000, CR4, Full),
++	__DEFINE_LINK_MODE_NAME(40000, SR4, Full),
++	__DEFINE_LINK_MODE_NAME(40000, LR4, Full),
++	__DEFINE_LINK_MODE_NAME(56000, KR4, Full),
++	__DEFINE_LINK_MODE_NAME(56000, CR4, Full),
++	__DEFINE_LINK_MODE_NAME(56000, SR4, Full),
++	__DEFINE_LINK_MODE_NAME(56000, LR4, Full),
++	__DEFINE_LINK_MODE_NAME(25000, CR, Full),
++	__DEFINE_LINK_MODE_NAME(25000, KR, Full),
++	__DEFINE_LINK_MODE_NAME(25000, SR, Full),
++	__DEFINE_LINK_MODE_NAME(50000, CR2, Full),
++	__DEFINE_LINK_MODE_NAME(50000, KR2, Full),
++	__DEFINE_LINK_MODE_NAME(100000, KR4, Full),
++	__DEFINE_LINK_MODE_NAME(100000, SR4, Full),
++	__DEFINE_LINK_MODE_NAME(100000, CR4, Full),
++	__DEFINE_LINK_MODE_NAME(100000, LR4_ER4, Full),
++	__DEFINE_LINK_MODE_NAME(50000, SR2, Full),
++	__DEFINE_LINK_MODE_NAME(1000, X, Full),
++	__DEFINE_LINK_MODE_NAME(10000, CR, Full),
++	__DEFINE_LINK_MODE_NAME(10000, SR, Full),
++	__DEFINE_LINK_MODE_NAME(10000, LR, Full),
++	__DEFINE_LINK_MODE_NAME(10000, LRM, Full),
++	__DEFINE_LINK_MODE_NAME(10000, ER, Full),
++	__DEFINE_LINK_MODE_NAME(2500, T, Full),
++	__DEFINE_LINK_MODE_NAME(5000, T, Full),
++	__DEFINE_SPECIAL_MODE_NAME(FEC_NONE, "None"),
++	__DEFINE_SPECIAL_MODE_NAME(FEC_RS, "RS"),
++	__DEFINE_SPECIAL_MODE_NAME(FEC_BASER, "BASER"),
++	__DEFINE_LINK_MODE_NAME(50000, KR, Full),
++	__DEFINE_LINK_MODE_NAME(50000, SR, Full),
++	__DEFINE_LINK_MODE_NAME(50000, CR, Full),
++	__DEFINE_LINK_MODE_NAME(50000, LR_ER_FR, Full),
++	__DEFINE_LINK_MODE_NAME(50000, DR, Full),
++	__DEFINE_LINK_MODE_NAME(100000, KR2, Full),
++	__DEFINE_LINK_MODE_NAME(100000, SR2, Full),
++	__DEFINE_LINK_MODE_NAME(100000, CR2, Full),
++	__DEFINE_LINK_MODE_NAME(100000, LR2_ER2_FR2, Full),
++	__DEFINE_LINK_MODE_NAME(100000, DR2, Full),
++	__DEFINE_LINK_MODE_NAME(200000, KR4, Full),
++	__DEFINE_LINK_MODE_NAME(200000, SR4, Full),
++	__DEFINE_LINK_MODE_NAME(200000, LR4_ER4_FR4, Full),
++	__DEFINE_LINK_MODE_NAME(200000, DR4, Full),
++	__DEFINE_LINK_MODE_NAME(200000, CR4, Full),
++	__DEFINE_LINK_MODE_NAME(100, T1, Full),
++	__DEFINE_LINK_MODE_NAME(1000, T1, Full),
++};
++
++static inline unsigned int ethnl_reply_header_size(void)
++{
++	return nla_total_size(nla_total_size(sizeof(u32)) +
++			nla_total_size(IFNAMSIZ));
++}
++
++static void ethnl_init_reply_data(struct ethnl_reply_data *reply_data,
++				  const struct ethnl_request_ops *ops,
++				  struct net_device *dev)
++{
++	memset(reply_data, 0, ops->reply_data_size);
++	reply_data->dev = dev;
++}
++
++int ethnl_fill_reply_header(struct sk_buff *skb, struct net_device *dev,
++			    u16 attrtype)
++{
++	struct nlattr *nest;
++
++	if (!dev)
++		return 0;
++	nest = nla_nest_start(skb, attrtype);
++	if (!nest)
++		return -EMSGSIZE;
++
++	if (nla_put_u32(skb, ETHTOOL_A_HEADER_DEV_INDEX, (u32)dev->ifindex) ||
++	    nla_put_string(skb, ETHTOOL_A_HEADER_DEV_NAME, dev->name))
++		goto nla_put_failure;
++	/* If more attributes are put into reply header, ethnl_header_size()
++	 * must be updated to account for them.
++	 */
++
++	nla_nest_end(skb, nest);
++	return 0;
++
++nla_put_failure:
++	nla_nest_cancel(skb, nest);
++	return -EMSGSIZE;
++}
++
++void *ethnl_bcastmsg_put(struct sk_buff *skb, u8 cmd)
++{
++	void *a;
++
++	a = genlmsg_put(skb, 0, ++ethnl_bcast_seq, &ethtool_genl_family, 0,
++			cmd);
++	return a;
++}
++
++int ethnl_multicast(struct sk_buff *skb, struct net_device *dev)
++{
++	return genlmsg_multicast_netns(&ethtool_genl_family, dev_net(dev), skb,
++			0, ETHNL_MCGRP_MONITOR, GFP_KERNEL);
++}
++
++static inline void ethnl_update_u32(u32 *dst, const struct nlattr *attr,
++				    bool *mod)
++{
++	u32 val;
++
++	if (!attr)
++		return;
++	val = nla_get_u32(attr);
++	if (*dst == val)
++		return;
++
++	*dst = val;
++	*mod = true;
++}
++
++static inline void ethnl_update_u8(u8 *dst, const struct nlattr *attr,
++				   bool *mod)
++{
++	u8 val;
++
++	if (!attr)
++		return;
++	val = nla_get_u8(attr);
++	if (*dst == val)
++		return;
++
++	*dst = val;
++	*mod = true;
++}
++
++static inline int ethnl_ops_begin(struct net_device *dev)
++{
++	if (dev && dev->ethtool_ops->begin)
++		return dev->ethtool_ops->begin(dev);
++	else
++		return 0;
++}
++
++static inline void ethnl_ops_complete(struct net_device *dev)
++{
++	if (dev && dev->ethtool_ops->complete)
++		dev->ethtool_ops->complete(dev);
++}
++
++static int linkmodes_reply_size(const struct ethnl_req_info *req_base,
++				const struct ethnl_reply_data *reply_base)
++{
++	const struct linkmodes_reply_data *data = LINKMODES_REPDATA(reply_base);
++	const struct ethtool_link_ksettings *ksettings = &data->ksettings;
++	const struct ethtool_link_settings *lsettings = &ksettings->base;
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	int len, ret;
++
++	len = nla_total_size(sizeof(u8)) /* LINKMODES_AUTONEG */
++		+ nla_total_size(sizeof(u32)) /* LINKMODES_SPEED */
++		+ nla_total_size(sizeof(u8)) /* LINKMODES_DUPLEX */
++		+ 0;
++	ret = ethnl_bitset_size(ksettings->link_modes.advertising,
++				ksettings->link_modes.supported,
++				__ETHTOOL_LINK_MODE_MASK_NBITS,
++				link_mode_names, compact);
++	if (ret < 0)
++		return ret;
++	len += ret;
++	if (!data->peer_empty) {
++		ret = ethnl_bitset_size(ksettings->link_modes.lp_advertising,
++					NULL, __ETHTOOL_LINK_MODE_MASK_NBITS,
++					link_mode_names, compact);
++		if (ret < 0)
++			return ret;
++		len += ret;
++	}
++
++	if (lsettings->master_slave_cfg != MASTER_SLAVE_CFG_UNSUPPORTED)
++		len += nla_total_size(sizeof(u8));
++
++	if (lsettings->master_slave_state != MASTER_SLAVE_STATE_UNSUPPORTED)
++		len += nla_total_size(sizeof(u8));
++
++	return len;
++}
++
++static int linkmodes_fill_reply(struct sk_buff *skb,
++				const struct ethnl_req_info *req_base,
++				const struct ethnl_reply_data *reply_base)
++{
++	const struct linkmodes_reply_data *data = LINKMODES_REPDATA(reply_base);
++	const struct ethtool_link_ksettings *ksettings = &data->ksettings;
++	const struct ethtool_link_settings *lsettings = &ksettings->base;
++	bool compact = req_base->flags & ETHTOOL_FLAG_COMPACT_BITSETS;
++	int ret;
++
++	if (nla_put_u8(skb, ETHTOOL_A_LINKMODES_AUTONEG, lsettings->autoneg))
++		return -EMSGSIZE;
++
++	ret = ethnl_put_bitset(skb, ETHTOOL_A_LINKMODES_OURS,
++			       ksettings->link_modes.advertising,
++			       ksettings->link_modes.supported,
++			       __ETHTOOL_LINK_MODE_MASK_NBITS, link_mode_names,
++			       compact);
++	if (ret < 0)
++		return -EMSGSIZE;
++	if (!data->peer_empty) {
++		ret = ethnl_put_bitset(skb, ETHTOOL_A_LINKMODES_PEER,
++				       ksettings->link_modes.lp_advertising,
++				       NULL, __ETHTOOL_LINK_MODE_MASK_NBITS,
++				       link_mode_names, compact);
++		if (ret < 0)
++			return -EMSGSIZE;
++	}
++
++	if (nla_put_u32(skb, ETHTOOL_A_LINKMODES_SPEED, lsettings->speed) ||
++	    nla_put_u8(skb, ETHTOOL_A_LINKMODES_DUPLEX, lsettings->duplex))
++		return -EMSGSIZE;
++
++	if (lsettings->master_slave_cfg != MASTER_SLAVE_CFG_UNSUPPORTED &&
++	    nla_put_u8(skb, ETHTOOL_A_LINKMODES_MASTER_SLAVE_CFG,
++		       lsettings->master_slave_cfg))
++		return -EMSGSIZE;
++
++	if (lsettings->master_slave_state != MASTER_SLAVE_STATE_UNSUPPORTED &&
++	    nla_put_u8(skb, ETHTOOL_A_LINKMODES_MASTER_SLAVE_STATE,
++		       lsettings->master_slave_state))
++		return -EMSGSIZE;
++
++	return 0;
++}
++
++const struct ethnl_request_ops ethnl_linkmodes_request_ops = {
++	.request_cmd            = ETHTOOL_MSG_LINKMODES_GET,
++	.reply_cmd              = ETHTOOL_MSG_LINKMODES_GET_REPLY,
++	.hdr_attr               = ETHTOOL_A_LINKMODES_HEADER,
++	.max_attr               = ETHTOOL_A_LINKMODES_MAX,
++	.req_info_size          = sizeof(struct linkmodes_req_info),
++	.reply_data_size        = sizeof(struct linkmodes_reply_data),
++	.request_policy         = linkmodes_get_policy,
++
++	.reply_size             = linkmodes_reply_size,
++	.fill_reply             = linkmodes_fill_reply,
++};
++
++static const struct ethnl_request_ops *
++ethnl_default_notify_ops[ETHTOOL_MSG_KERNEL_MAX + 1] = {
++	[ETHTOOL_MSG_LINKMODES_NTF]     = &ethnl_linkmodes_request_ops,
++};
++
++/* default notification handler */
++static void ethnl_default_notify(struct net_device *dev, unsigned int cmd,
++				 const void *data)
++{
++	struct ethnl_reply_data *reply_data;
++	const struct ethnl_request_ops *ops;
++	struct ethnl_req_info *req_info;
++	struct sk_buff *skb;
++	void *reply_payload;
++	int reply_len;
++	int ret;
++
++	if (WARN_ONCE(cmd > ETHTOOL_MSG_KERNEL_MAX ||
++		      !ethnl_default_notify_ops[cmd],
++		      "unexpected notification type %u\n", cmd))
++		return;
++	ops = ethnl_default_notify_ops[cmd];
++	req_info = kzalloc(ops->req_info_size, GFP_KERNEL);
++	if (!req_info)
++		return;
++	reply_data = kmalloc(ops->reply_data_size, GFP_KERNEL);
++	if (!reply_data) {
++		kfree(req_info);
++		return;
++	}
++
++	req_info->dev = dev;
++	req_info->flags |= ETHTOOL_FLAG_COMPACT_BITSETS;
++
++	ethnl_init_reply_data(reply_data, ops, dev);
++	ret = ops->prepare_data(req_info, reply_data, NULL);
++	if (ret < 0)
++		goto err_cleanup;
++	ret = ops->reply_size(req_info, reply_data);
++	if (ret < 0)
++		goto err_cleanup;
++	reply_len = ret + ethnl_reply_header_size();
++	ret = -ENOMEM;
++	skb = genlmsg_new(reply_len, GFP_KERNEL);
++	if (!skb)
++		goto err_cleanup;
++	reply_payload = ethnl_bcastmsg_put(skb, cmd);
++	if (!reply_payload)
++		goto err_skb;
++	ret = ethnl_fill_reply_header(skb, dev, ops->hdr_attr);
++	if (ret < 0)
++		goto err_msg;
++	ret = ops->fill_reply(skb, req_info, reply_data);
++	if (ret < 0)
++		goto err_msg;
++	if (ops->cleanup_data)
++		ops->cleanup_data(reply_data);
++
++	genlmsg_end(skb, reply_payload);
++	kfree(reply_data);
++	kfree(req_info);
++	ethnl_multicast(skb, dev);
++	return;
++
++err_msg:
++	WARN_ONCE(ret == -EMSGSIZE,
++		  "calculated message payload length (%d) not sufficient\n",
++			reply_len);
++err_skb:
++	nlmsg_free(skb);
++err_cleanup:
++	if (ops->cleanup_data)
++		ops->cleanup_data(reply_data);
++	kfree(reply_data);
++	kfree(req_info);
++	return;
++}
++
++static const ethnl_notify_handler_t ethnl_notify_handlers[] = {
++	[ETHTOOL_MSG_LINKMODES_NTF]     = ethnl_default_notify,
++};
++
++/* LINKMODES_SET */
++
++static const struct link_mode_info link_mode_params[] = {
++	__DEFINE_LINK_MODE_PARAMS(10, T, Half),
++	__DEFINE_LINK_MODE_PARAMS(10, T, Full),
++	__DEFINE_LINK_MODE_PARAMS(100, T, Half),
++	__DEFINE_LINK_MODE_PARAMS(100, T, Full),
++	__DEFINE_LINK_MODE_PARAMS(1000, T, Half),
++	__DEFINE_LINK_MODE_PARAMS(1000, T, Full),
++	__DEFINE_SPECIAL_MODE_PARAMS(Autoneg),
++	__DEFINE_SPECIAL_MODE_PARAMS(TP),
++	__DEFINE_SPECIAL_MODE_PARAMS(AUI),
++	__DEFINE_SPECIAL_MODE_PARAMS(MII),
++	__DEFINE_SPECIAL_MODE_PARAMS(FIBRE),
++	__DEFINE_SPECIAL_MODE_PARAMS(BNC),
++	__DEFINE_LINK_MODE_PARAMS(10000, T, Full),
++	__DEFINE_SPECIAL_MODE_PARAMS(Pause),
++	__DEFINE_SPECIAL_MODE_PARAMS(Asym_Pause),
++	__DEFINE_LINK_MODE_PARAMS(2500, X, Full),
++	__DEFINE_SPECIAL_MODE_PARAMS(Backplane),
++	__DEFINE_LINK_MODE_PARAMS(1000, KX, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, KX4, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, KR, Full),
++	[ETHTOOL_LINK_MODE_10000baseR_FEC_BIT] = {
++		.speed	= SPEED_10000,
++		.duplex = DUPLEX_FULL,
++	},
++	__DEFINE_LINK_MODE_PARAMS(20000, MLD2, Full),
++	__DEFINE_LINK_MODE_PARAMS(20000, KR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(40000, KR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(40000, CR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(40000, SR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(40000, LR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(56000, KR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(56000, CR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(56000, SR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(56000, LR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(25000, CR, Full),
++	__DEFINE_LINK_MODE_PARAMS(25000, KR, Full),
++	__DEFINE_LINK_MODE_PARAMS(25000, SR, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, CR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, KR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, KR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, SR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, CR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, LR4_ER4, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, SR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(1000, X, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, CR, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, SR, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, LR, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, LRM, Full),
++	__DEFINE_LINK_MODE_PARAMS(10000, ER, Full),
++	__DEFINE_LINK_MODE_PARAMS(2500, T, Full),
++	__DEFINE_LINK_MODE_PARAMS(5000, T, Full),
++	__DEFINE_SPECIAL_MODE_PARAMS(FEC_NONE),
++	__DEFINE_SPECIAL_MODE_PARAMS(FEC_RS),
++	__DEFINE_SPECIAL_MODE_PARAMS(FEC_BASER),
++	__DEFINE_LINK_MODE_PARAMS(50000, KR, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, SR, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, CR, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, LR_ER_FR, Full),
++	__DEFINE_LINK_MODE_PARAMS(50000, DR, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, KR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, SR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, CR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, LR2_ER2_FR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(100000, DR2, Full),
++	__DEFINE_LINK_MODE_PARAMS(200000, KR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(200000, SR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(200000, LR4_ER4_FR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(200000, DR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(200000, CR4, Full),
++	__DEFINE_LINK_MODE_PARAMS(100, T1, Full),
++	__DEFINE_LINK_MODE_PARAMS(1000, T1, Full),
++};
++
++static const struct nla_policy
++linkmodes_set_policy[ETHTOOL_A_LINKMODES_MAX + 1] = {
++	[ETHTOOL_A_LINKMODES_UNSPEC]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_HEADER]		= { .type = NLA_NESTED },
++	[ETHTOOL_A_LINKMODES_AUTONEG]		= { .type = NLA_U8 },
++	[ETHTOOL_A_LINKMODES_OURS]		= { .type = NLA_NESTED },
++	[ETHTOOL_A_LINKMODES_PEER]		= { .type = NLA_REJECT },
++	[ETHTOOL_A_LINKMODES_SPEED]		= { .type = NLA_U32 },
++	[ETHTOOL_A_LINKMODES_DUPLEX]		= { .type = NLA_U8 },
++	[ETHTOOL_A_LINKMODES_MASTER_SLAVE_CFG]	= { .type = NLA_U8 },
++	[ETHTOOL_A_LINKMODES_MASTER_SLAVE_STATE] = { .type = NLA_REJECT },
++};
++
++int ethnl_parse_header_dev_get(struct ethnl_req_info *req_info,
++			       const struct nlattr *header, struct net *net,
++			       struct netlink_ext_ack *extack, bool require_dev)
++{
++	struct nlattr *tb[ETHTOOL_A_HEADER_MAX + 1];
++	const struct nlattr *devname_attr;
++	struct net_device *dev = NULL;
++	u32 flags = 0;
++	int ret;
++
++	if (!header) {
++		NL_SET_ERR_MSG(extack, "request header missing");
++		return -EINVAL;
++	}
++	ret = nla_parse_nested(tb, ETHTOOL_A_HEADER_MAX, header,
++			       ethnl_header_policy, extack);
++	if (ret < 0)
++		return ret;
++	if (tb[ETHTOOL_A_HEADER_FLAGS]) {
++		flags = nla_get_u32(tb[ETHTOOL_A_HEADER_FLAGS]);
++		if (flags & ~ETHTOOL_FLAG_ALL) {
++			NL_SET_ERR_MSG_ATTR(extack, tb[ETHTOOL_A_HEADER_FLAGS],
++					    "unrecognized request flags");
++			nl_set_extack_cookie_u32(extack, ETHTOOL_FLAG_ALL);
++			return -EOPNOTSUPP;
++		}
++	}
++
++	devname_attr = tb[ETHTOOL_A_HEADER_DEV_NAME];
++	if (tb[ETHTOOL_A_HEADER_DEV_INDEX]) {
++		u32 ifindex = nla_get_u32(tb[ETHTOOL_A_HEADER_DEV_INDEX]);
++
++		dev = dev_get_by_index(net, ifindex);
++		if (!dev) {
++			NL_SET_ERR_MSG_ATTR(extack,
++					    tb[ETHTOOL_A_HEADER_DEV_INDEX],
++					    "no device matches ifindex");
++			return -ENODEV;
++		}
++		/* if both ifindex and ifname are passed, they must match */
++		if (devname_attr &&
++		    strncmp(dev->name, nla_data(devname_attr), IFNAMSIZ)) {
++			dev_put(dev);
++
++			NL_SET_ERR_MSG_ATTR(extack, header,
++					    "ifindex and name do not match");
++			return -ENODEV;
++		}
++	} else if (devname_attr) {
++		dev = dev_get_by_name(net, nla_data(devname_attr));
++		if (!dev) {
++			NL_SET_ERR_MSG_ATTR(extack, devname_attr,
++					    "no device matches name");
++			return -ENODEV;
++		}
++	} else if (require_dev) {
++		NL_SET_ERR_MSG_ATTR(extack, header,
++				    "neither ifindex nor name specified");
++		return -EINVAL;
++	}
++
++	if (dev && !netif_device_present(dev)) {
++		dev_put(dev);
++		NL_SET_ERR_MSG(extack, "device not present");
++		return -ENODEV;
++	}
++
++	req_info->dev = dev;
++	req_info->flags = flags;
++	return 0;
++}
++
++static bool ethnl_auto_linkmodes(struct ethtool_link_ksettings *ksettings,
++				 bool req_speed, bool req_duplex)
++{
++	unsigned long *advertising = ksettings->link_modes.advertising;
++	unsigned long *supported = ksettings->link_modes.supported;
++	DECLARE_BITMAP(old_adv, __ETHTOOL_LINK_MODE_MASK_NBITS);
++	unsigned int i;
++
++	BUILD_BUG_ON(ARRAY_SIZE(link_mode_params) !=
++		     __ETHTOOL_LINK_MODE_MASK_NBITS);
++
++	bitmap_copy(old_adv, advertising, __ETHTOOL_LINK_MODE_MASK_NBITS);
++
++	for (i = 0; i < __ETHTOOL_LINK_MODE_MASK_NBITS; i++) {
++		const struct link_mode_info *info = &link_mode_params[i];
++
++		if (info->speed == SPEED_UNKNOWN)
++			continue;
++		if (test_bit(i, supported) &&
++		    (!req_speed || info->speed == ksettings->base.speed) &&
++		    (!req_duplex || info->duplex == ksettings->base.duplex))
++			set_bit(i, advertising);
++		else
++			clear_bit(i, advertising);
++	}
++
++	return !bitmap_equal(old_adv, advertising,
++			     __ETHTOOL_LINK_MODE_MASK_NBITS);
++}
++
++static bool ethnl_validate_master_slave_cfg(u8 cfg)
++{
++	switch (cfg) {
++	case MASTER_SLAVE_CFG_MASTER_PREFERRED:
++	case MASTER_SLAVE_CFG_SLAVE_PREFERRED:
++	case MASTER_SLAVE_CFG_MASTER_FORCE:
++	case MASTER_SLAVE_CFG_SLAVE_FORCE:
++		return true;
++	}
++
++	return false;
++}
++
++static int ethnl_update_linkmodes(struct genl_info *info, struct nlattr **tb,
++				  struct ethtool_link_ksettings *ksettings,
++				  bool *mod)
++{
++	struct ethtool_link_settings *lsettings = &ksettings->base;
++	bool req_speed, req_duplex;
++	const struct nlattr *master_slave_cfg;
++	int ret;
++
++	master_slave_cfg = tb[ETHTOOL_A_LINKMODES_MASTER_SLAVE_CFG];
++	if (master_slave_cfg) {
++		u8 cfg = nla_get_u8(master_slave_cfg);
++
++		if (lsettings->master_slave_cfg == MASTER_SLAVE_CFG_UNSUPPORTED) {
++			NL_SET_ERR_MSG_ATTR(info->extack, master_slave_cfg,
++					    "master/slave configuration not supported by device");
++			return -EOPNOTSUPP;
++		}
++
++		if (!ethnl_validate_master_slave_cfg(cfg)) {
++			NL_SET_ERR_MSG_ATTR(info->extack, master_slave_cfg,
++					    "master/slave value is invalid");
++			return -EOPNOTSUPP;
++		}
++	}
++
++	*mod = false;
++	req_speed = tb[ETHTOOL_A_LINKMODES_SPEED];
++	req_duplex = tb[ETHTOOL_A_LINKMODES_DUPLEX];
++
++	ethnl_update_u8(&lsettings->autoneg, tb[ETHTOOL_A_LINKMODES_AUTONEG],
++			mod);
++	ret = ethnl_update_bitset(ksettings->link_modes.advertising,
++				  __ETHTOOL_LINK_MODE_MASK_NBITS,
++				  tb[ETHTOOL_A_LINKMODES_OURS], link_mode_names,
++				  info->extack, mod);
++	if (ret < 0)
++		return ret;
++	ethnl_update_u32(&lsettings->speed, tb[ETHTOOL_A_LINKMODES_SPEED],
++			 mod);
++	ethnl_update_u8(&lsettings->duplex, tb[ETHTOOL_A_LINKMODES_DUPLEX],
++			mod);
++	ethnl_update_u8(&lsettings->master_slave_cfg, master_slave_cfg, mod);
++
++	if (!tb[ETHTOOL_A_LINKMODES_OURS] && lsettings->autoneg &&
++	    (req_speed || req_duplex) &&
++	    ethnl_auto_linkmodes(ksettings, req_speed, req_duplex))
++		*mod = true;
++
++	return 0;
++}
++
++int ethnl_set_linkmodes(struct sk_buff *skb, struct genl_info *info)
++{
++	struct nlattr *tb[ETHTOOL_A_LINKMODES_MAX + 1];
++	struct ethtool_link_ksettings ksettings = {};
++	struct ethnl_req_info req_info = {};
++	struct net_device *dev;
++	bool mod = false;
++	int ret;
++
++	ret = nlmsg_parse(info->nlhdr, GENL_HDRLEN, tb,
++			  ETHTOOL_A_LINKMODES_MAX, linkmodes_set_policy,
++			  info->extack);
++	if (ret < 0)
++		return ret;
++	ret = ethnl_parse_header_dev_get(&req_info,
++					 tb[ETHTOOL_A_LINKMODES_HEADER],
++					 genl_info_net(info), info->extack,
++					 true);
++	if (ret < 0)
++		return ret;
++	dev = req_info.dev;
++	ret = -EOPNOTSUPP;
++	if (!dev->ethtool_ops->get_link_ksettings ||
++	    !dev->ethtool_ops->set_link_ksettings)
++		goto out_dev;
++
++	rtnl_lock();
++	ret = ethnl_ops_begin(dev);
++	if (ret < 0)
++		goto out_rtnl;
++
++	ret = __ethtool_get_link_ksettings(dev, &ksettings);
++	if (ret < 0) {
++		if (info)
++			GENL_SET_ERR_MSG(info, "failed to retrieve link settings");
++		goto out_ops;
++	}
++
++	ret = ethnl_update_linkmodes(info, tb, &ksettings, &mod);
++	if (ret < 0)
++		goto out_ops;
++
++	if (mod) {
++		ret = dev->ethtool_ops->set_link_ksettings(dev, &ksettings);
++		if (ret < 0)
++			GENL_SET_ERR_MSG(info, "link settings update failed");
++		else
++			ethtool_notify(dev, ETHTOOL_MSG_LINKMODES_NTF, NULL);
++	}
++
++out_ops:
++	ethnl_ops_complete(dev);
++out_rtnl:
++	rtnl_unlock();
++out_dev:
++	dev_put(dev);
++	return ret;
++}
++
++void ethtool_notify(struct net_device *dev, unsigned int cmd, const void *data)
++{
++	if (unlikely(!ethnl_ok))
++		return;
++	ASSERT_RTNL();
++
++	if (likely(cmd < ARRAY_SIZE(ethnl_notify_handlers) &&
++		   ethnl_notify_handlers[cmd]))
++		ethnl_notify_handlers[cmd](dev, cmd, data);
++	else
++		WARN_ONCE(1, "notification %u not implemented (dev=%s)\n",
++			  cmd, netdev_name(dev));
++}
++EXPORT_SYMBOL(ethtool_notify);
